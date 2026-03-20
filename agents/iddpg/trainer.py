@@ -1,13 +1,16 @@
 import os
+from copy import deepcopy
+
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 
 from agents.base_trainer import BaseTrainer
-from agents.common.buffer import ReplayBuffer
 from agents.common.utils import soft_update
-from agents.iddpg.networks import Actor, Critic
+from agents.iddpg.buffer import Experience, ReplayMemory
+from agents.iddpg.networks import ActorNetworkAllNeiWRadar, CriticSingleTwoPortionWRadar
 
 
 class IDDPGTrainer(BaseTrainer):
@@ -15,96 +18,288 @@ class IDDPGTrainer(BaseTrainer):
         super().__init__(config)
 
         self.device = torch.device(config["device"])
+        self.dtype_name = config.get("dtype", "float32")
+        self.torch_dtype = torch.float64 if self.dtype_name == "float64" else torch.float32
+        self.numpy_dtype = np.float64 if self.dtype_name == "float64" else np.float32
         self.n_agents = config["env"]["n_agents"]
-        self.obs_dim = config["env"]["obs_dim"]
         self.action_dim = config["env"]["action_dim"]
         self.hidden_dim = config["train"]["hidden_dim"]
         self.gamma = config["train"]["gamma"]
         self.tau = config["train"]["tau"]
         self.batch_size = config["train"]["batch_size"]
+        self.update_every = config["train"]["update_every"]
+        self.flags = config.get("flags", {})
+        self.exploration = config.get("exploration", {})
 
-        self.actors = []
-        self.target_actors = []
-        self.critics = []
-        self.target_critics = []
-        self.actor_optimizers = []
-        self.critic_optimizers = []
+        self.actor = None
+        self.actor_target = None
+        self.critic = None
+        self.critic_target = None
+        self.actor_optimizer = None
+        self.critic_optimizer = None
 
-        for _ in range(self.n_agents):
-            actor = Actor(self.obs_dim, self.action_dim, self.hidden_dim).to(self.device)
-            target_actor = Actor(self.obs_dim, self.action_dim, self.hidden_dim).to(self.device)
-            target_actor.load_state_dict(actor.state_dict())
+        self.buffer = ReplayMemory(config["train"]["buffer_size"])
+        self.update_step = 0
+        self.action_step = 0
+        self.current_episode = 1
+        self.pending_load_path = None
 
-            critic = Critic(self.obs_dim, self.action_dim, self.hidden_dim).to(self.device)
-            target_critic = Critic(self.obs_dim, self.action_dim, self.hidden_dim).to(self.device)
-            target_critic.load_state_dict(critic.state_dict())
+    def _require_supported_configuration(self):
+        if self.flags.get("full_observable_critic"):
+            raise NotImplementedError("Current IDDPG port only supports non-full-observable critic mode.")
+        if self.flags.get("use_gru"):
+            raise NotImplementedError("Current IDDPG port does not support GRU mode yet.")
+        if self.flags.get("use_selfatt_with_radar"):
+            raise NotImplementedError("Current IDDPG port does not support self-attention radar mode yet.")
+        if self.flags.get("use_single_portion_selfatt"):
+            raise NotImplementedError("Current IDDPG port does not support single-portion self-attention mode yet.")
+        if not self.flags.get("use_all_neigh_with_radar", False):
+            raise NotImplementedError("Current IDDPG port expects use_all_neigh_with_radar=True.")
+        if self.flags.get("own_obs_only"):
+            raise NotImplementedError("Current IDDPG port does not support own_obs_only mode yet.")
 
-            self.actors.append(actor)
-            self.target_actors.append(target_actor)
-            self.critics.append(critic)
-            self.target_critics.append(target_critic)
+    def _extract_dims(self, obs):
+        if len(obs) < 3:
+            raise ValueError("Expected observation with three portions: own obs, neighbors, radar.")
+        return [len(obs[0][0]), len(obs[1][0]), len(obs[2][0])]
 
-            self.actor_optimizers.append(optim.Adam(actor.parameters(), lr=config["train"]["actor_lr"]))
-            self.critic_optimizers.append(optim.Adam(critic.parameters(), lr=config["train"]["critic_lr"]))
-
-        self.buffer = ReplayBuffer(config["train"]["buffer_size"])
-
-    def select_action(self, obs, evaluate=False):
-        actions = []
-        for i in range(self.n_agents):
-            obs_tensor = torch.tensor(obs[i], dtype=torch.float32, device=self.device).unsqueeze(0)
-            with torch.no_grad():
-                action = self.actors[i](obs_tensor).cpu().numpy()[0]
-            if not evaluate:
-                action += np.random.normal(0, 0.1, size=self.action_dim)
-            actions.append(np.clip(action, -1.0, 1.0))
-        return actions
-
-    def store_transition(self, obs, actions, rewards, next_obs, dones):
-        self.buffer.push(obs, actions, rewards, next_obs, dones)
-
-    def update(self):
-        if len(self.buffer) < self.batch_size:
+    def _ensure_models_initialized(self, obs):
+        if self.actor is not None:
             return
 
-        obs_b, actions_b, rewards_b, next_obs_b, dones_b = self.buffer.sample(self.batch_size)
+        self._require_supported_configuration()
+        actor_dim = self._extract_dims(obs)
+        critic_dim = actor_dim
 
-        for agent_i in range(self.n_agents):
-            obs = torch.tensor(np.array([o[agent_i] for o in obs_b]), dtype=torch.float32, device=self.device)
-            actions = torch.tensor(np.array([a[agent_i] for a in actions_b]), dtype=torch.float32, device=self.device)
-            rewards = torch.tensor(np.array([r[agent_i] for r in rewards_b]), dtype=torch.float32, device=self.device).unsqueeze(-1)
-            next_obs = torch.tensor(np.array([no[agent_i] for no in next_obs_b]), dtype=torch.float32, device=self.device)
-            dones = torch.tensor(np.array([d[agent_i] for d in dones_b]), dtype=torch.float32, device=self.device).unsqueeze(-1)
+        self.actor = ActorNetworkAllNeiWRadar(actor_dim, self.action_dim).to(device=self.device, dtype=self.torch_dtype)
+        self.actor_target = deepcopy(self.actor).to(device=self.device, dtype=self.torch_dtype)
+        self.critic = CriticSingleTwoPortionWRadar(critic_dim, self.action_dim).to(device=self.device, dtype=self.torch_dtype)
+        self.critic_target = deepcopy(self.critic).to(device=self.device, dtype=self.torch_dtype)
 
-            with torch.no_grad():
-                next_actions = self.target_actors[agent_i](next_obs)
-                target_q = self.target_critics[agent_i](next_obs, next_actions)
-                y = rewards + self.gamma * (1 - dones) * target_q
+        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=self.config["train"]["actor_lr"])
+        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=self.config["train"]["critic_lr"])
 
-            current_q = self.critics[agent_i](obs, actions)
-            critic_loss = F.mse_loss(current_q, y)
+        if self.pending_load_path is not None:
+            self._load_state(self.pending_load_path)
+            self.pending_load_path = None
 
-            self.critic_optimizers[agent_i].zero_grad()
-            critic_loss.backward()
-            self.critic_optimizers[agent_i].step()
+    def begin_episode(self, episode):
+        self.current_episode = max(1, int(episode))
 
-            pred_actions = self.actors[agent_i](obs)
-            actor_loss = -self.critics[agent_i](obs, pred_actions).mean()
+    def _noise_scale(self):
+        mode = self.config.get("train", {}).get("stop_mode", "episode")
+        start = float(self.exploration.get("eps_start", 1.0))
+        end = float(self.exploration.get("eps_end", 0.03))
+        period = max(1, int(self.exploration.get("eps_period", 1)))
+        progress = self.action_step if mode == "step" else self.current_episode
 
-            self.actor_optimizers[agent_i].zero_grad()
+        if progress > period:
+            return end
+        if period == 1:
+            return end
+
+        slope = (end - start) / float(period - 1)
+        return start + slope * float(progress - 1)
+
+    def select_action(self, obs, evaluate=False):
+        self._ensure_models_initialized(obs)
+
+        obs_tensor = torch.tensor(np.stack(obs[0]), dtype=self.torch_dtype, device=self.device)
+        nei_tensor = torch.tensor(np.stack(obs[1]), dtype=self.torch_dtype, device=self.device)
+        radar_tensor = torch.tensor(np.stack(obs[2]), dtype=self.torch_dtype, device=self.device)
+
+        actions = []
+        with torch.no_grad():
+            for i in range(self.n_agents):
+                action = self.actor(
+                    [
+                        obs_tensor[i].unsqueeze(0),
+                        nei_tensor[i].unsqueeze(0),
+                        radar_tensor[i].unsqueeze(0),
+                    ]
+                ).cpu().numpy()[0]
+                if not evaluate:
+                    action += np.random.normal(0, self._noise_scale(), size=self.action_dim).astype(self.numpy_dtype)
+                actions.append(np.clip(action, -1.0, 1.0).astype(self.numpy_dtype))
+
+        self.action_step += 1
+        return actions
+
+    def _prepare_replay_portions(self, state):
+        prepared_state = []
+        for element_idx, element in enumerate(state):
+            if element_idx != len(state) - 1:
+                prepared_state.append(torch.from_numpy(np.stack(element)).to(device=self.device, dtype=self.torch_dtype))
+            else:
+                sur_agents = []
+                for each_agent_list in element:
+                    sur_agents.append(
+                        torch.from_numpy(np.squeeze(np.array(each_agent_list), axis=1)).to(
+                            device=self.device,
+                            dtype=self.torch_dtype,
+                        )
+                    )
+                prepared_state.append(sur_agents)
+        return prepared_state
+
+    def _split_per_agent(self, prepared_state):
+        per_agent_state = []
+        for i in range(self.n_agents):
+            one_agent_state = []
+            for observation_portion in prepared_state:
+                if isinstance(observation_portion, list):
+                    one_agent_state.append(observation_portion[i])
+                else:
+                    one_agent_state.append(observation_portion[i, :])
+            per_agent_state.append(one_agent_state)
+        return per_agent_state
+
+
+    def store_transition(self, obs, actions, rewards, next_obs, dones, history=None, cur_hidden=None, next_hidden=None):
+        self._ensure_models_initialized(obs)
+
+        prepared_obs = self._prepare_replay_portions(obs)
+        prepared_next_obs = self._prepare_replay_portions(next_obs)
+        reward_tensor = torch.tensor(np.array(rewards), dtype=self.torch_dtype, device=self.device)
+        done_tensor = torch.tensor(np.array([int(value) for value in dones]), dtype=self.torch_dtype, device=self.device)
+        action_tensor = torch.tensor(np.array(actions), dtype=self.torch_dtype, device=self.device)
+
+        one_agent_obs = self._split_per_agent(prepared_obs)
+        one_agent_next_obs = self._split_per_agent(prepared_next_obs)
+
+        history_tensor = None if history is None else torch.tensor(np.array(history), dtype=self.torch_dtype, device=self.device)
+
+        for i in range(len(one_agent_next_obs)):
+            self.buffer.push(
+                one_agent_obs[i][0].detach().cpu().numpy().astype(self.numpy_dtype),
+                one_agent_obs[i][1].detach().cpu().numpy().astype(self.numpy_dtype),
+                one_agent_obs[i][2].detach().cpu().numpy().astype(self.numpy_dtype),
+                action_tensor[i, :].detach().cpu().numpy().astype(self.numpy_dtype),
+                one_agent_next_obs[i][0].detach().cpu().numpy().astype(self.numpy_dtype),
+                one_agent_next_obs[i][1].detach().cpu().numpy().astype(self.numpy_dtype),
+                one_agent_next_obs[i][2].detach().cpu().numpy().astype(self.numpy_dtype),
+                float(reward_tensor[i].item()),
+                float(done_tensor[i].item()),
+                None if history_tensor is None else history_tensor[:, i, :].detach().cpu().numpy().astype(self.numpy_dtype),
+                None if cur_hidden is None else np.asarray(cur_hidden[i], dtype=self.numpy_dtype),
+                None if next_hidden is None else np.asarray(next_hidden[i], dtype=self.numpy_dtype),
+            )
+
+    def update(self, i_episode=None, total_step_count=None, single_eps_critic_cal_record=None):
+        if self.actor is None:
+            return None
+        if single_eps_critic_cal_record is None:
+            single_eps_critic_cal_record = []
+        if len(self.buffer) <= self.batch_size:
+            return None, None, single_eps_critic_cal_record
+
+        self._require_supported_configuration()
+
+        if i_episode is None:
+            i_episode = self.current_episode
+        self.train_num = i_episode
+
+        c_loss = []
+        a_loss = []
+
+        transitions = self.buffer.sample(self.batch_size)
+        batch = Experience(*zip(*transitions))
+
+        stacked_elem_0 = torch.tensor(np.array(batch.states_obs), dtype=self.torch_dtype, device=self.device)
+        stacked_elem_1 = torch.tensor(np.array(batch.states_nei), dtype=self.torch_dtype, device=self.device)
+        stacked_elem_2 = torch.tensor(np.array(batch.states_grid), dtype=self.torch_dtype, device=self.device)
+
+        next_stacked_elem_0 = torch.tensor(np.array(batch.next_states_obs), dtype=self.torch_dtype, device=self.device)
+        next_stacked_elem_1 = torch.tensor(np.array(batch.next_states_nei), dtype=self.torch_dtype, device=self.device)
+        next_stacked_elem_2 = torch.tensor(np.array(batch.next_states_grid), dtype=self.torch_dtype, device=self.device)
+
+        dones_stacked = torch.tensor(np.array(batch.dones), dtype=self.torch_dtype, device=self.device)
+        reward_batch = torch.tensor(np.array(batch.rewards), dtype=self.torch_dtype, device=self.device)
+        action_batch = torch.tensor(np.array(batch.actions), dtype=self.torch_dtype, device=self.device)
+
+        non_final_next_states_actorin = [next_stacked_elem_0, next_stacked_elem_1, next_stacked_elem_2]
+        whole_curren_action = action_batch
+
+        non_final_next_actions = self.actor_target(
+            [
+                non_final_next_states_actorin[0],
+                non_final_next_states_actorin[1],
+                non_final_next_states_actorin[2],
+            ]
+        )
+        non_final_next_combine_actions = non_final_next_actions
+
+        current_Q = self.critic([stacked_elem_0, stacked_elem_1, stacked_elem_2], action_batch)
+
+        with torch.no_grad():
+            next_target_critic_value = self.critic_target(
+                [next_stacked_elem_0, next_stacked_elem_1, next_stacked_elem_2],
+                non_final_next_combine_actions,
+            ).squeeze()
+
+            reward_cal = reward_batch.clone()
+            tar_Q_before_rew = self.gamma * next_target_critic_value * (1 - dones_stacked)
+            target_Q = reward_batch + (self.gamma * next_target_critic_value * (1 - dones_stacked))
+            target_Q = target_Q.unsqueeze(1)
+            tar_Q_after_rew = target_Q.clone()
+
+        loss_Q = nn.MSELoss()(current_Q, target_Q.detach())
+        cal_loss_Q = loss_Q.clone()
+        single_eps_critic_cal_record.append([
+            tar_Q_before_rew.detach().cpu().numpy(),
+            reward_cal.detach().cpu().numpy(),
+            tar_Q_after_rew.detach().cpu().numpy(),
+            cal_loss_Q.detach().cpu().numpy(),
+            (tar_Q_before_rew.detach().cpu().numpy().min(), tar_Q_before_rew.detach().cpu().numpy().max()),
+            (reward_cal.detach().cpu().numpy().min(), reward_cal.detach().cpu().numpy().max()),
+            (tar_Q_after_rew.detach().cpu().numpy().min(), tar_Q_after_rew.detach().cpu().numpy().max()),
+            (cal_loss_Q.detach().cpu().numpy().min(), cal_loss_Q.detach().cpu().numpy().max()),
+        ])
+        self.critic_optimizer.zero_grad()
+        loss_Q.backward()
+        self.critic_optimizer.step()
+
+        action_i = self.actor([stacked_elem_0, stacked_elem_1, stacked_elem_2])
+        ac = action_i.squeeze(0)
+        actor_loss = -self.critic([stacked_elem_0, stacked_elem_1, stacked_elem_2], ac).mean()
+
+        if self.flags.get("transfer_learning", False):
+            if i_episode > 10000:
+                self.actor_optimizer.zero_grad()
+                actor_loss.backward()
+                self.actor_optimizer.step()
+        else:
+            self.actor_optimizer.zero_grad()
             actor_loss.backward()
-            self.actor_optimizers[agent_i].step()
+            self.actor_optimizer.step()
 
-            soft_update(self.target_actors[agent_i], self.actors[agent_i], self.tau)
-            soft_update(self.target_critics[agent_i], self.critics[agent_i], self.tau)
+        c_loss.append(loss_Q)
+        a_loss.append(actor_loss)
+
+        if i_episode % self.update_every == 0:
+            soft_update(self.critic_target, self.critic, self.tau)
+            soft_update(self.actor_target, self.actor, self.tau)
+
+        return c_loss, a_loss, single_eps_critic_cal_record
 
     def save(self, path):
+        if self.actor is None or self.critic is None:
+            return
+
         os.makedirs(path, exist_ok=True)
-        for i in range(self.n_agents):
-            torch.save(self.actors[i].state_dict(), os.path.join(path, f"iddpg_actor_{i}.pt"))
-            torch.save(self.critics[i].state_dict(), os.path.join(path, f"iddpg_critic_{i}.pt"))
+        torch.save(self.actor.state_dict(), os.path.join(path, "iddpg_actor.pt"))
+        torch.save(self.critic.state_dict(), os.path.join(path, "iddpg_critic.pt"))
+
+    def _load_state(self, path):
+        actor_path = os.path.join(path, "iddpg_actor.pt")
+        critic_path = os.path.join(path, "iddpg_critic.pt")
+        self.actor.load_state_dict(torch.load(actor_path, map_location=self.device))
+        self.critic.load_state_dict(torch.load(critic_path, map_location=self.device))
+        self.actor_target = deepcopy(self.actor)
+        self.critic_target = deepcopy(self.critic)
 
     def load(self, path):
-        for i in range(self.n_agents):
-            self.actors[i].load_state_dict(torch.load(os.path.join(path, f"iddpg_actor_{i}.pt"), map_location=self.device))
-            self.critics[i].load_state_dict(torch.load(os.path.join(path, f"iddpg_critic_{i}.pt"), map_location=self.device))
+        if self.actor is None or self.critic is None:
+            self.pending_load_path = path
+            return
+        self._load_state(path)
