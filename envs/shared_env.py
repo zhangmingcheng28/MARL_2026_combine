@@ -1681,20 +1681,13 @@ class SharedMultiAgentEnv:
         dist_to_goal = 0
 
         for drone_idx, drone_obj in self.all_uavs.items():
-            host_current_circle = Point(drone_obj.pos[0], drone_obj.pos[1]).buffer(drone_obj.protectiveBound)
-            tar_circle = Point(drone_obj.goal[-1]).buffer(1, cap_style='round')
-            with warnings.catch_warnings():
-                warnings.simplefilter('ignore', category=RuntimeWarning)
-                goal_cur_intru_intersect = host_current_circle.intersection(tar_circle)
-            if not goal_cur_intru_intersect.is_empty:
-                drone_obj.reach_target = True
-
-        for drone_idx, drone_obj in self.all_uavs.items():
             if xy[0] is not None and xy[1] is not None and drone_idx > 0:
                 continue
             if xy[0] is not None and xy[1] is not None:
                 drone_obj.pos = np.array([xy[0], xy[1]])
                 drone_obj.pre_pos = drone_obj.pos
+
+            reached_before_step = drone_obj.reach_target
 
             collision_drones = []
             collide_building = 0
@@ -1758,7 +1751,7 @@ class SharedMultiAgentEnv:
                 diff_dist_vec = drone_obj.pos - self.all_uavs[neigh_keys].pos
                 euclidean_dist_diff = np.linalg.norm(diff_dist_vec)
 
-                if self.all_uavs[neigh_keys].reach_target or drone_obj.reach_target:
+                if self.all_uavs[neigh_keys].reach_target or reached_before_step:
                     euclidean_dist_diff = math.inf
                 else:
                     all_neigh_dist.append(euclidean_dist_diff)
@@ -1779,7 +1772,7 @@ class SharedMultiAgentEnv:
                         if self.all_uavs[neigh_keys].drone_collision \
                                 or self.all_uavs[neigh_keys].building_collision \
                                 or self.all_uavs[neigh_keys].reach_target \
-                                or drone_obj.reach_target \
+                                or reached_before_step \
                                 or drone_obj.building_collision \
                                 or drone_obj.drone_collision \
                                 or self.all_uavs[neigh_keys].bound_collision:
@@ -1788,7 +1781,7 @@ class SharedMultiAgentEnv:
                         drone_obj.drone_collision = True
                         self.all_uavs[neigh_keys].drone_collision = True
                     else:
-                        if self.all_uavs[neigh_keys].reach_target or drone_obj.reach_target:
+                        if self.all_uavs[neigh_keys].reach_target or reached_before_step:
                             pass
                         else:
                             neigh_collision_bearing = calculate_bearing(
@@ -1811,14 +1804,15 @@ class SharedMultiAgentEnv:
 
             start_of_v1_time = time.time()
             v1_decision = 0
-            possiblePoly = self.all_buildingSTR.query(host_current_circle)
-            for element in possiblePoly:
-                if self.all_buildingSTR.geometries.take(element).intersection(host_current_circle):
-                    collide_building = 1
-                    v1_decision = collide_building
-                    drone_obj.collide_wall_count += 1
-                    drone_obj.building_collision = True
-                    break
+            if not reached_before_step:
+                possiblePoly = self.all_buildingSTR.query(host_current_circle)
+                for element in possiblePoly:
+                    if self.all_buildingSTR.geometries.take(element).intersection(host_current_circle):
+                        collide_building = 1
+                        v1_decision = collide_building
+                        drone_obj.collide_wall_count += 1
+                        drone_obj.building_collision = True
+                        break
             end_v1_time = (time.time() - start_of_v1_time) * 1000 * 1000
 
             end_v2_time, end_v3_time, v2_decision, v3_decision = 0, 0, 0, 0
@@ -1917,7 +1911,13 @@ class SharedMultiAgentEnv:
             else:
                 near_building_penalty = 0
 
-            if x_left_bound.intersects(host_passed_volume) or x_right_bound.intersects(host_passed_volume) or y_bottom_bound.intersects(host_passed_volume) or y_top_bound.intersects(host_passed_volume):
+            if reached_before_step:
+                check_goal[drone_idx] = True
+                agent_to_remove.append(drone_idx)
+                rew = rew + reach_target + near_goal_reward
+                reward.append(np.array(rew))
+                done.append(False)
+            elif x_left_bound.intersects(host_passed_volume) or x_right_bound.intersects(host_passed_volume) or y_bottom_bound.intersects(host_passed_volume) or y_top_bound.intersects(host_passed_volume):
                 drone_obj.bound_collision = True
                 rew = rew - crash_penalty_wall
                 if args.mode == 'eval' and evaluation_by_episode is False:
@@ -1966,11 +1966,11 @@ class SharedMultiAgentEnv:
                 eps_status_holder,
                 drone_idx,
                 np.array(after_dist_hg),
-                    [
-                        np.array(dist_to_goal), cross_err_distance, dist_to_ref_line,
-                        np.array(near_building_penalty), small_step_penalty,
-                        np.linalg.norm(drone_obj.vel), near_goal_reward,
-                        seg_reward, nearest_pt, drone_obj.observableSpace,
+                [
+                    np.array(dist_to_goal), cross_err_distance, dist_to_ref_line,
+                    np.array(near_building_penalty), small_step_penalty,
+                    np.linalg.norm(drone_obj.vel), near_goal_reward,
+                    seg_reward, nearest_pt, drone_obj.observableSpace,
                     drone_obj.heading, np.array(near_drone_penalty),
                 ],
             )
