@@ -33,7 +33,6 @@ class SharedMultiAgentEnv:
     def __init__(
             self,
             n_agents: int,
-            obs_dim: int,
             action_dim: int,
             max_steps: int = 50,
             resource_file: Optional[str] = None,
@@ -58,7 +57,6 @@ class SharedMultiAgentEnv:
             mode: str = "train",
     ):
         self.n_agents = n_agents
-        self.obs_dim = obs_dim
         self.action_dim = action_dim
         self.max_steps = max_steps
         self.gamma = gamma
@@ -174,7 +172,6 @@ class SharedMultiAgentEnv:
 
         env = cls(
             n_agents=env_cfg["n_agents"],
-            obs_dim=env_cfg["obs_dim"],
             action_dim=env_cfg["action_dim"],
             max_steps=env_cfg["max_steps"],
             resource_file=env_cfg.get("resource_file"),
@@ -1969,13 +1966,40 @@ class SharedMultiAgentEnv:
                 eps_status_holder,
                 drone_idx,
                 np.array(after_dist_hg),
-                [
-                    np.array(dist_to_goal), cross_err_distance, dist_to_ref_line,
-                    np.array(near_building_penalty), small_step_penalty,
-                    np.linalg.norm(drone_obj.vel), near_goal_reward,
-                    seg_reward, nearest_pt, drone_obj.observableSpace,
+                    [
+                        np.array(dist_to_goal), cross_err_distance, dist_to_ref_line,
+                        np.array(near_building_penalty), small_step_penalty,
+                        np.linalg.norm(drone_obj.vel), near_goal_reward,
+                        seg_reward, nearest_pt, drone_obj.observableSpace,
                     drone_obj.heading, np.array(near_drone_penalty),
                 ],
+            )
+
+        reach_target_state = [agent.reach_target for _, agent in self.all_uavs.items()]
+        goal_state_mismatch = [
+            {
+                "agent_idx": agent_idx,
+                "check_goal": check_goal[agent_idx],
+                "reach_target": agent.reach_target,
+                "bound_collision": agent.bound_collision,
+                "building_collision": agent.building_collision,
+                "drone_collision": agent.drone_collision,
+                "position": agent.pos.tolist() if isinstance(agent.pos, np.ndarray) else agent.pos,
+                "goal": agent.goal[-1].tolist() if isinstance(agent.goal[-1], np.ndarray) else agent.goal[-1],
+                "reward": float(reward[agent_idx]) if agent_idx < len(reward) else None,
+                "done": bool(done[agent_idx]) if agent_idx < len(done) else None,
+                "bound_building_check": list(bound_building_check),
+            }
+            for agent_idx, agent in self.all_uavs.items()
+            if check_goal[agent_idx] != agent.reach_target
+        ]
+        if goal_state_mismatch:
+            raise ValueError(
+                "ss_reward_Mar goal-state mismatch detected. check_goal={} reach_target={} details={}".format(
+                    check_goal,
+                    reach_target_state,
+                    goal_state_mismatch,
+                )
             )
 
         if full_observable_critic_flag:

@@ -18,7 +18,7 @@ class BaseTrainer(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def save(self, path: str):
+    def save(self, path: str, episode: int = None, step: int = None):
         raise NotImplementedError
 
     @abstractmethod

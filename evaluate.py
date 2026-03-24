@@ -1,7 +1,8 @@
 import numpy as np
-
+import os
 from envs.shared_env import SharedMultiAgentEnv
 from agents import build_trainer
+from utils.plotting_helper import *
 
 
 def main(config):
@@ -21,14 +22,7 @@ def main(config):
     total_agent_num = env.n_agents
     total_step = 0
     collision_count = 0
-    one_drone_reach = 0
-    two_drone_reach = 0
-    three_drone_reach = 0
-    four_drone_reach = 0
-    five_drone_reach = 0
-    six_drone_reach = 0
-    seven_drone_reach = 0
-    all_drone_reach = 0
+    drone_reached_per_eps = 0
     all_steps_used = 0
     sorties_reached = 0
     idle_drone = 0
@@ -66,6 +60,14 @@ def main(config):
             step_reward_record = info["step_reward_record"]
             eps_status_holder = info["status_holder"]
             bound_building_check = info["bound_building_check"]
+            agent_reach_target = [agent.reach_target for agent_idx, agent in env.all_uavs.items()]
+
+            if list(check_goal) != agent_reach_target:
+                raise ValueError(
+                    "Goal status mismatch at episode {}, step {}: info['check_goal']={} vs reach_target={}".format(
+                        episode, step, list(check_goal), agent_reach_target
+                    )
+                )
 
             traj_step_list = []
             for each_agent_idx, each_agent in env.all_uavs.items():
@@ -114,15 +116,20 @@ def main(config):
                         episode, step - 1
                     )
                 )
-            elif all(check_goal):
+            elif all(check_goal) and all(agent_reach_target):
                 episode_decision[2] = True
-                print(
-                    "All agents have reached their destinations at step {}, episode {} terminated.".format(
-                        step - 1, episode
-                    )
+                static_png_path = os.path.join(
+                    config["paths"]["project_root"],
+                    "resources",
+                    "static_traj_episode_{}.png".format(episode),
                 )
-            elif all([agent.reach_target for agent_idx, agent in env.all_uavs.items()]):
-                episode_decision[2] = True
+                view_static_traj_DWTD(
+                    env=env,
+                    trajectory_eachPlay=trajectory_eachPlay,
+                    random_map_idx=0,
+                    save_path=static_png_path,
+                    max_time_step=len(trajectory_eachPlay),
+                )
                 print(
                     "All agents have reached their destinations at step {}, episode {} terminated.".format(
                         step - 1, episode
@@ -150,24 +157,7 @@ def main(config):
                     else:
                         all_steps_used = all_steps_used + 1
 
-                    if True in episode_goal_found:
-                        num_true = sum(episode_goal_found)
-                        if num_true == 1:
-                            one_drone_reach = one_drone_reach + 1
-                        elif num_true == 2:
-                            two_drone_reach = two_drone_reach + 1
-                        elif num_true == 3:
-                            three_drone_reach = three_drone_reach + 1
-                        elif num_true == 4:
-                            four_drone_reach = four_drone_reach + 1
-                        elif num_true == 5:
-                            five_drone_reach = five_drone_reach + 1
-                        elif num_true == 6:
-                            six_drone_reach = six_drone_reach + 1
-                        elif num_true == 7:
-                            seven_drone_reach = seven_drone_reach + 1
-                        else:
-                            all_drone_reach = all_drone_reach + 1
+                    drone_reached_per_eps = drone_reached_per_eps + sum(episode_goal_found)
                 else:
                     for each_agent in env.all_uavs.values():
                         if each_agent.bound_collision:
@@ -196,14 +186,12 @@ def main(config):
             crash_to_drone, crash_due_to_nearest
         ))
         print("all steps used count is {}, {}%".format(all_steps_used, round(all_steps_used / eval_episodes * 100, 2)))
-        print("One goal reached count is {}, {}%".format(one_drone_reach, round(one_drone_reach / eval_episodes * 100, 2)))
-        print("Two goal reached count is {}, {}%".format(two_drone_reach, round(two_drone_reach / eval_episodes * 100, 2)))
-        print("Three goal reached count is {}, {}%".format(three_drone_reach, round(three_drone_reach / eval_episodes * 100, 2)))
-        print("Four goal reached count is {}, {}%".format(four_drone_reach, round(four_drone_reach / eval_episodes * 100, 2)))
-        print("Five goal reached count is {}, {}%".format(five_drone_reach, round(five_drone_reach / eval_episodes * 100, 2)))
-        print("Six goal reached count is {}, {}%".format(six_drone_reach, round(six_drone_reach / eval_episodes * 100, 2)))
-        print("Seven goal reached count is {}, {}%".format(seven_drone_reach, round(seven_drone_reach / eval_episodes * 100, 2)))
-        print("All goal reached count is {}, {}%".format(all_drone_reach, round(all_drone_reach / eval_episodes * 100, 2)))
+        print("Reached-goal drones count is {}, avg {:.2f} per episode".format(
+            drone_reached_per_eps, drone_reached_per_eps / eval_episodes
+        ))
+        print("Reached-goal drone ratio is {}%".format(
+            round(drone_reached_per_eps / (eval_episodes * env.n_agents) * 100, 2)
+        ))
     else:
         print("Total collision {}".format(collision_count))
         print("Collision to bound {}".format(crash_to_bound))

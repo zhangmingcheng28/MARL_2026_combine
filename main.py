@@ -35,6 +35,5 @@ def main():
             f"Unknown mode: {mode}. Supported modes are: train, evaluate"
         )
 
-
 if __name__ == "__main__":
     main()

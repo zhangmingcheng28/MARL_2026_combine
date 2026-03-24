@@ -11,7 +11,7 @@ DEFAULT_CONFIG = {
     "mode": "train",  # or evaluate
     "algorithm": "iddpg",
     "exp_name": "default_exp",
-    "save_interval": 10,
+    "save_interval": 1000,
     "paths": {
         "project_root": str(PROJECT_ROOT),
         "resource_env_var": DEFAULT_RESOURCE_ENV_VAR,
@@ -23,7 +23,6 @@ DEFAULT_CONFIG = {
     },
     "env": {
         "n_agents": 8,
-        "obs_dim": 6,
         "action_dim": 2,
         "max_steps": 100,
         "grid_obs_shape": [7, 7],
@@ -41,8 +40,8 @@ DEFAULT_CONFIG = {
         "num_episodes": 20000,
         "total_steps": 2000000,
         "stop_mode": "episode",  # or "step"
-        "batch_size": 256,
-        "buffer_size": 1000000,
+        "batch_size": 512,
+        "buffer_size": int(1e5),
         "actor_lr": 0.0001,
         "critic_lr": 0.0001,
         "gamma": 0.95,
@@ -53,7 +52,7 @@ DEFAULT_CONFIG = {
     "exploration": {
         "eps_start": 1.0,
         "eps_end": 0.03,
-        "eps_period": 8500,  # the noise finishes decaying and reaches eps_end.”
+        "eps_period": 10000,  # the noise finishes decaying and reaches eps_end.”
         "largest_noise_sigma": 0.5,
         "smallest_noise_sigma": 0.15,
         "initial_noise_sigma": 0.5,
@@ -96,7 +95,7 @@ def get_args():
     parser.add_argument("--exp_name", type=str, default=DEFAULT_CONFIG["exp_name"])
 
     parser.add_argument("--n_agents", type=int, default=DEFAULT_CONFIG["env"]["n_agents"])
-    parser.add_argument("--obs_dim", type=int, default=DEFAULT_CONFIG["env"]["obs_dim"])
+    parser.add_argument("--obs_dim", type=int, default=None)
     parser.add_argument("--action_dim", type=int, default=DEFAULT_CONFIG["env"]["action_dim"])
     parser.add_argument("--max_steps", type=int, default=DEFAULT_CONFIG["env"]["max_steps"])
     parser.add_argument("--max_x", type=int, default=DEFAULT_CONFIG["env"]["max_x"])
@@ -176,7 +175,6 @@ def build_config(args):
     config["paths"]["legacy_code_dir"] = _resolve_optional_path(args.legacy_code_dir)
 
     config["env"]["n_agents"] = args.n_agents
-    config["env"]["obs_dim"] = args.obs_dim
     config["env"]["action_dim"] = args.action_dim
     config["env"]["max_steps"] = args.max_steps
     config["env"]["grid_obs_shape"] = list(args.grid_obs_shape)
@@ -220,4 +218,12 @@ def build_config(args):
     config["env"]["evaluation_by_episode"] = config["flags"]["evaluation_by_episode"]
 
     config["eval"]["episodes"] = args.eval_episodes
+
+    if args.algo in ("maddpg", "matd3"):
+        if args.obs_dim is None:
+            raise ValueError("--obs_dim is required when --algo is 'maddpg' or 'matd3'.")
+        config["env"]["obs_dim"] = args.obs_dim
+    else:
+        config["env"].pop("obs_dim", None)
+
     return config

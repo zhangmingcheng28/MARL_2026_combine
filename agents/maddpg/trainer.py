@@ -117,11 +117,19 @@ class MADDPGTrainer(BaseTrainer):
             soft_update(self.target_actors[agent_i], self.actors[agent_i], self.tau)
             soft_update(self.target_critics[agent_i], self.critics[agent_i], self.tau)
 
-    def save(self, path):
+    def save(self, path, episode=None, step=None):
         os.makedirs(path, exist_ok=True)
         for i in range(self.n_agents):
-            torch.save(self.actors[i].state_dict(), os.path.join(path, f"maddpg_actor_{i}.pt"))
-            torch.save(self.critics[i].state_dict(), os.path.join(path, f"maddpg_critic_{i}.pt"))
+            actor_path = os.path.join(path, f"maddpg_actor_{i}.pt")
+            critic_path = os.path.join(path, f"maddpg_critic_{i}.pt")
+            torch.save(self.actors[i].state_dict(), actor_path)
+            torch.save(self.critics[i].state_dict(), critic_path)
+            if episode is not None:
+                torch.save(self.actors[i].state_dict(), os.path.join(path, f"maddpg_actor_{i}_ep{int(episode)}.pt"))
+                torch.save(self.critics[i].state_dict(), os.path.join(path, f"maddpg_critic_{i}_ep{int(episode)}.pt"))
+            if step is not None:
+                torch.save(self.actors[i].state_dict(), os.path.join(path, f"maddpg_actor_{i}_step{int(step)}.pt"))
+                torch.save(self.critics[i].state_dict(), os.path.join(path, f"maddpg_critic_{i}_step{int(step)}.pt"))
 
     def load(self, path):
         for i in range(self.n_agents):

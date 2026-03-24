@@ -1,7 +1,12 @@
+import csv
+import os
+import pickle
+import numpy as np
+
 from envs.shared_env import SharedMultiAgentEnv
 from agents import build_trainer
 from config.paths import create_training_run_dirs
-
+from utils.plotting_helper import *
 
 
 def main(config):
@@ -19,15 +24,12 @@ def main(config):
     total_steps = 0
     episode = 0
     score_history = []
+    eps_reward_record = []
+    eps_noise_record = []
+    eps_time_record = []
+    eps_check_collision = []
     collision_count = 0
-    one_drone_reach = 0
-    two_drone_reach = 0
-    three_drone_reach = 0
-    four_drone_reach = 0
-    five_drone_reach = 0
-    six_drone_reach = 0
-    seven_drone_reach = 0
-    all_drone_reach = 0
+    drone_reached_per_eps = 0
     all_steps_used = 0
     crash_to_bound = 0
     crash_to_building = 0
@@ -52,6 +54,7 @@ def main(config):
         episode_reward = 0.0
         episode_decision = [False] * 3
         episode_goal_found = [False] * env.n_agents
+        trajectory_eachPlay = []
 
         for step in range(env_cfg["max_steps"]):
             if stop_mode == "step" and total_steps >= total_steps_budget:
@@ -72,6 +75,24 @@ def main(config):
             total_steps += 1
             episode_reward += sum(rewards)
             current_step = step + 1
+            info_check_goal = list(info["check_goal"])
+            agent_reach_target = [agent.reach_target for _, agent in env.all_uavs.items()]
+
+            # if info_check_goal != agent_reach_target:
+            #     raise ValueError(
+            #         "Goal status mismatch at episode {}, step {}: info['check_goal']={} vs reach_target={}".format(
+            #             episode, current_step, info_check_goal, agent_reach_target
+            #         )
+            #     )
+
+            traj_step_list = []
+            for each_agent_idx, each_agent in env.all_uavs.items():
+                traj_step_list.append([
+                    each_agent.pos[0],
+                    each_agent.pos[1],
+                    np.array(info["step_reward_record"][each_agent_idx][1]),
+                ])
+            trajectory_eachPlay.append(traj_step_list)
 
             if env_cfg["max_steps"] < current_step:
                 episode_decision[0] = True
@@ -87,14 +108,8 @@ def main(config):
                         episode, current_step - 1
                     )
                 )
-            elif all(info["check_goal"]):
-                episode_decision[2] = True
-                print(
-                    "All agents have reached their destinations at step {}, episode {} terminated.".format(
-                        current_step - 1, episode
-                    )
-                )
-            elif all([agent.reach_target for _, agent in env.all_uavs.items()]):
+            elif all(info_check_goal) or all(agent_reach_target):
+            # elif all(info_check_goal) and all(agent_reach_target):
                 episode_decision[2] = True
                 print(
                     "All agents have reached their destinations at step {}, episode {} terminated.".format(
@@ -106,9 +121,12 @@ def main(config):
                 for agent_idx, agent in env.all_uavs.items():
                     episode_goal_found[agent_idx] = agent.reach_target
                 score_history.append(episode_reward)
+                eps_reward_record.append(episode_reward)
+                eps_time_record.append(current_step)
 
                 if True in dones and current_step < env_cfg["max_steps"]:
                     collision_count = collision_count + 1
+                    eps_check_collision.append(True)
                     if info["bound_building_check"][0]:
                         crash_to_bound = crash_to_bound + 1
                     elif info["bound_building_check"][1]:
@@ -119,25 +137,11 @@ def main(config):
                             crash_due_to_nearest = crash_due_to_nearest + 1
                 else:
                     all_steps_used = all_steps_used + 1
+                    eps_check_collision.append(False)
 
-                if True in episode_goal_found:
-                    num_true = sum(episode_goal_found)
-                    if num_true == 1:
-                        one_drone_reach = one_drone_reach + 1
-                    elif num_true == 2:
-                        two_drone_reach = two_drone_reach + 1
-                    elif num_true == 3:
-                        three_drone_reach = three_drone_reach + 1
-                    elif num_true == 4:
-                        four_drone_reach = four_drone_reach + 1
-                    elif num_true == 5:
-                        five_drone_reach = five_drone_reach + 1
-                    elif num_true == 6:
-                        six_drone_reach = six_drone_reach + 1
-                    elif num_true == 7:
-                        seven_drone_reach = seven_drone_reach + 1
-                    else:
-                        all_drone_reach = all_drone_reach + 1
+                drone_reached_per_eps = drone_reached_per_eps + sum(episode_goal_found)
+                noise_scale = getattr(trainer, "_noise_scale", None)
+                eps_noise_record.append(noise_scale() if callable(noise_scale) else None)
                 break
 
         print(f"[TRAIN] Episode {episode}/{num_episodes} | Reward: {episode_reward:.3f}")
@@ -154,40 +158,15 @@ def main(config):
             print("all steps used count is {}, {}%".format(
                 all_steps_used, round(all_steps_used / 100 * 100, 2)
             ))
-            print("One goal reached count is {}, {}%".format(
-                one_drone_reach, round(one_drone_reach / num_episodes * 100, 2)
+            print("Reached-goal drones count is {}, avg {:.2f} per episode".format(
+                drone_reached_per_eps, drone_reached_per_eps / 100
             ))
-            print("Two goal reached count is {}, {}%".format(
-                two_drone_reach, round(two_drone_reach / num_episodes * 100, 2)
+            print("Reached-goal drone ratio is {}%".format(
+                round(drone_reached_per_eps / (100 * env.n_agents) * 100, 2)
             ))
-            print("Three goal reached count is {}, {}%".format(
-                three_drone_reach, round(three_drone_reach / num_episodes * 100, 2)
-            ))
-            print("Four goal reached count is {}, {}%".format(
-                four_drone_reach, round(four_drone_reach / num_episodes * 100, 2)
-            ))
-            print("Five goal reached count is {}, {}%".format(
-                five_drone_reach, round(five_drone_reach / num_episodes * 100, 2)
-            ))
-            print("Six goal reached count is {}, {}%".format(
-                six_drone_reach, round(six_drone_reach / num_episodes * 100, 2)
-            ))
-            print("Seven goal reached count is {}, {}%".format(
-                seven_drone_reach, round(seven_drone_reach / num_episodes * 100, 2)
-            ))
-            print("All goal reached count is {}, {}%".format(
-                all_drone_reach, round(all_drone_reach / num_episodes * 100, 2)
-            ))
-
+            save_gif(env, trajectory_eachPlay, plot_dir, "train", episode)
             collision_count = 0
-            one_drone_reach = 0
-            two_drone_reach = 0
-            three_drone_reach = 0
-            four_drone_reach = 0
-            five_drone_reach = 0
-            six_drone_reach = 0
-            seven_drone_reach = 0
-            all_drone_reach = 0
+            drone_reached_per_eps = 0
             all_steps_used = 0
             crash_to_bound = 0
             crash_to_building = 0
@@ -195,7 +174,19 @@ def main(config):
             crash_due_to_nearest = 0
 
         if episode % config["save_interval"] == 0:
-            trainer.save(checkpoint_dir)
+            trainer.save(checkpoint_dir, episode=episode, step=total_steps)
 
-    trainer.save(checkpoint_dir)
+    with open(os.path.join(plot_dir, "all_episode_reward.pickle"), "wb") as handle:
+        pickle.dump(eps_reward_record, handle, protocol=pickle.HIGHEST_PROTOCOL)
+    with open(os.path.join(plot_dir, "all_episode_noise.pickle"), "wb") as handle:
+        pickle.dump(eps_noise_record, handle, protocol=pickle.HIGHEST_PROTOCOL)
+    with open(os.path.join(plot_dir, "all_episode_time.pickle"), "wb") as handle:
+        pickle.dump(eps_time_record, handle, protocol=pickle.HIGHEST_PROTOCOL)
+    with open(os.path.join(plot_dir, "all_episode_collision.pickle"), "wb") as handle:
+        pickle.dump(eps_check_collision, handle, protocol=pickle.HIGHEST_PROTOCOL)
+    with open(os.path.join(plot_dir, "GFG.csv"), "w", newline="") as f:
+        write = csv.writer(f)
+        write.writerows([score_history])
+
+    trainer.save(checkpoint_dir, episode=episode, step=total_steps)
     print(f"[TRAIN] Finished. Checkpoints saved to: {checkpoint_dir}")

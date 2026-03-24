@@ -282,13 +282,22 @@ class IDDPGTrainer(BaseTrainer):
 
         return c_loss, a_loss, single_eps_critic_cal_record
 
-    def save(self, path):
+    def save(self, path, episode=None, step=None):
         if self.actor is None or self.critic is None:
             return
 
         os.makedirs(path, exist_ok=True)
-        torch.save(self.actor.state_dict(), os.path.join(path, "iddpg_actor.pt"))
-        torch.save(self.critic.state_dict(), os.path.join(path, "iddpg_critic.pt"))
+        actor_path = os.path.join(path, "iddpg_actor.pt")
+        critic_path = os.path.join(path, "iddpg_critic.pt")
+        torch.save(self.actor.state_dict(), actor_path)
+        torch.save(self.critic.state_dict(), critic_path)
+
+        if episode is not None:
+            torch.save(self.actor.state_dict(), os.path.join(path, "iddpg_actor_ep{}.pt".format(int(episode))))
+            torch.save(self.critic.state_dict(), os.path.join(path, "iddpg_critic_ep{}.pt".format(int(episode))))
+        if step is not None:
+            torch.save(self.actor.state_dict(), os.path.join(path, "iddpg_actor_step{}.pt".format(int(step))))
+            torch.save(self.critic.state_dict(), os.path.join(path, "iddpg_critic_step{}.pt".format(int(step))))
 
     def _load_state(self, path):
         actor_path = os.path.join(path, "iddpg_actor.pt")

@@ -148,12 +148,23 @@ class MATD3Trainer(BaseTrainer):
                 soft_update(self.target_critic1[agent_i], self.critic1[agent_i], self.tau)
                 soft_update(self.target_critic2[agent_i], self.critic2[agent_i], self.tau)
 
-    def save(self, path):
+    def save(self, path, episode=None, step=None):
         os.makedirs(path, exist_ok=True)
         for i in range(self.n_agents):
-            torch.save(self.actors[i].state_dict(), os.path.join(path, f"matd3_actor_{i}.pt"))
-            torch.save(self.critic1[i].state_dict(), os.path.join(path, f"matd3_critic1_{i}.pt"))
-            torch.save(self.critic2[i].state_dict(), os.path.join(path, f"matd3_critic2_{i}.pt"))
+            actor_path = os.path.join(path, f"matd3_actor_{i}.pt")
+            critic1_path = os.path.join(path, f"matd3_critic1_{i}.pt")
+            critic2_path = os.path.join(path, f"matd3_critic2_{i}.pt")
+            torch.save(self.actors[i].state_dict(), actor_path)
+            torch.save(self.critic1[i].state_dict(), critic1_path)
+            torch.save(self.critic2[i].state_dict(), critic2_path)
+            if episode is not None:
+                torch.save(self.actors[i].state_dict(), os.path.join(path, f"matd3_actor_{i}_ep{int(episode)}.pt"))
+                torch.save(self.critic1[i].state_dict(), os.path.join(path, f"matd3_critic1_{i}_ep{int(episode)}.pt"))
+                torch.save(self.critic2[i].state_dict(), os.path.join(path, f"matd3_critic2_{i}_ep{int(episode)}.pt"))
+            if step is not None:
+                torch.save(self.actors[i].state_dict(), os.path.join(path, f"matd3_actor_{i}_step{int(step)}.pt"))
+                torch.save(self.critic1[i].state_dict(), os.path.join(path, f"matd3_critic1_{i}_step{int(step)}.pt"))
+                torch.save(self.critic2[i].state_dict(), os.path.join(path, f"matd3_critic2_{i}_step{int(step)}.pt"))
 
     def load(self, path):
         for i in range(self.n_agents):
