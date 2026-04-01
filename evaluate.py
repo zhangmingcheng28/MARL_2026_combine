@@ -5,12 +5,26 @@ from agents import build_trainer
 from utils.plotting_helper import *
 
 
+def _build_checkpoint_tag(paths_config):
+    checkpoint_kind = paths_config.get("checkpoint_kind")
+    checkpoint_value = paths_config.get("checkpoint_value")
+    if checkpoint_kind in (None, "") or checkpoint_value in (None, ""):
+        return None
+    return "{}{}".format(checkpoint_kind, int(checkpoint_value))
+
+
 def main(config):
     config["mode"] = "eval"
     env = SharedMultiAgentEnv.from_config(config)
     trainer = build_trainer(config)
-    checkpoint_dir = config.get("paths", {}).get("checkpoint_dir", "checkpoints")
-    trainer.load(checkpoint_dir)
+    checkpoint_paths = config.get("paths", {})
+    checkpoint_dir = checkpoint_paths.get("checkpoint_dir", "checkpoints")
+    checkpoint_tag = _build_checkpoint_tag(checkpoint_paths)
+    trainer.load(checkpoint_dir, checkpoint_tag=checkpoint_tag)
+    if checkpoint_tag:
+        print(f"[EVAL] Loading checkpoint '{checkpoint_tag}' from: {checkpoint_dir}")
+    else:
+        print(f"[EVAL] Loading latest/default checkpoint files from: {checkpoint_dir}")
 
     flags = config.get("flags", {})
     env_cfg = config["env"]

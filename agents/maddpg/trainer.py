@@ -131,7 +131,9 @@ class MADDPGTrainer(BaseTrainer):
                 torch.save(self.actors[i].state_dict(), os.path.join(path, f"maddpg_actor_{i}_step{int(step)}.pt"))
                 torch.save(self.critics[i].state_dict(), os.path.join(path, f"maddpg_critic_{i}_step{int(step)}.pt"))
 
-    def load(self, path):
+    def load(self, path, checkpoint_tag=None):
         for i in range(self.n_agents):
-            self.actors[i].load_state_dict(torch.load(os.path.join(path, f"maddpg_actor_{i}.pt"), map_location=self.device))
-            self.critics[i].load_state_dict(torch.load(os.path.join(path, f"maddpg_critic_{i}.pt"), map_location=self.device))
+            actor_name = f"maddpg_actor_{i}.pt" if checkpoint_tag is None else f"maddpg_actor_{i}_{checkpoint_tag}.pt"
+            critic_name = f"maddpg_critic_{i}.pt" if checkpoint_tag is None else f"maddpg_critic_{i}_{checkpoint_tag}.pt"
+            self.actors[i].load_state_dict(torch.load(os.path.join(path, actor_name), map_location=self.device))
+            self.critics[i].load_state_dict(torch.load(os.path.join(path, critic_name), map_location=self.device))

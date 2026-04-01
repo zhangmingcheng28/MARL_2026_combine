@@ -22,5 +22,5 @@ class BaseTrainer(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def load(self, path: str):
+    def load(self, path: str, checkpoint_tag: str = None):
         raise NotImplementedError

@@ -80,7 +80,8 @@ class IDDPGTrainer(BaseTrainer):
         self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=self.config["train"]["critic_lr"])
 
         if self.pending_load_path is not None:
-            self._load_state(self.pending_load_path)
+            pending_path, pending_checkpoint_tag = self.pending_load_path
+            self._load_state(pending_path, pending_checkpoint_tag)
             self.pending_load_path = None
 
     def begin_episode(self, episode):
@@ -299,16 +300,22 @@ class IDDPGTrainer(BaseTrainer):
             torch.save(self.actor.state_dict(), os.path.join(path, "iddpg_actor_step{}.pt".format(int(step))))
             torch.save(self.critic.state_dict(), os.path.join(path, "iddpg_critic_step{}.pt".format(int(step))))
 
-    def _load_state(self, path):
-        actor_path = os.path.join(path, "iddpg_actor.pt")
-        critic_path = os.path.join(path, "iddpg_critic.pt")
+    def _load_state(self, path, checkpoint_tag=None):
+        actor_name = "iddpg_actor.pt"
+        critic_name = "iddpg_critic.pt"
+        if checkpoint_tag:
+            actor_name = f"iddpg_actor_{checkpoint_tag}.pt"
+            critic_name = f"iddpg_critic_{checkpoint_tag}.pt"
+
+        actor_path = os.path.join(path, actor_name)
+        critic_path = os.path.join(path, critic_name)
         self.actor.load_state_dict(torch.load(actor_path, map_location=self.device))
         self.critic.load_state_dict(torch.load(critic_path, map_location=self.device))
         self.actor_target = deepcopy(self.actor)
         self.critic_target = deepcopy(self.critic)
 
-    def load(self, path):
+    def load(self, path, checkpoint_tag=None):
         if self.actor is None or self.critic is None:
-            self.pending_load_path = path
+            self.pending_load_path = (path, checkpoint_tag)
             return
-        self._load_state(path)
+        self._load_state(path, checkpoint_tag)

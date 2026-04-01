@@ -8,7 +8,7 @@ DEFAULT_CONFIG = {
     "seed": 777,
     "device": "auto",
     "dtype": "float32",
-    "mode": "train",  # or evaluate
+    "mode": "evaluate",  # or evaluate
     "algorithm": "iddpg",
     "exp_name": "default_exp",
     "save_interval": 1000,
@@ -16,6 +16,9 @@ DEFAULT_CONFIG = {
         "project_root": str(PROJECT_ROOT),
         "resource_env_var": DEFAULT_RESOURCE_ENV_VAR,
         "checkpoint_dir": "checkpoints",
+        "checkpoint_run": "240326_03_18_20",
+        "checkpoint_kind": "ep",
+        "checkpoint_value": 10000,
         "resource_file": None,
         "shape_file": "resources/lakesideMap/lakeSide.shp",
         "agent_config_file": "resources/fixedDrone_3drones.xlsx",
@@ -72,7 +75,7 @@ DEFAULT_CONFIG = {
 
     },
     "eval": {
-        "episodes": 3,
+        "episodes": 100,
     },
 }
 
@@ -85,6 +88,12 @@ def _resolve_optional_path(raw_path):
     if raw_path in (None, ""):
         return None
     return resolve_path(raw_path)
+
+
+def _build_checkpoint_tag(checkpoint_kind, checkpoint_value):
+    if checkpoint_kind in (None, "") or checkpoint_value in (None, ""):
+        return None
+    return "{}{}".format(checkpoint_kind, int(checkpoint_value))
 
 
 def get_args():
@@ -149,6 +158,9 @@ def get_args():
     parser.add_argument("--save_interval", type=int, default=DEFAULT_CONFIG["save_interval"])
 
     parser.add_argument("--checkpoint_dir", type=str, default=DEFAULT_CONFIG["paths"]["checkpoint_dir"])
+    parser.add_argument("--checkpoint_run", type=str, default=DEFAULT_CONFIG["paths"]["checkpoint_run"])
+    parser.add_argument("--checkpoint_kind", type=str, choices=["ep", "step"], default=DEFAULT_CONFIG["paths"]["checkpoint_kind"])
+    parser.add_argument("--checkpoint_value", type=int, default=DEFAULT_CONFIG["paths"]["checkpoint_value"])
     parser.add_argument("--resource_file", type=str, default=DEFAULT_CONFIG["paths"]["resource_file"])
     parser.add_argument("--shape_file", type=str, default=DEFAULT_CONFIG["paths"]["shape_file"])
     parser.add_argument("--agent_config_file", type=str, default=DEFAULT_CONFIG["paths"]["agent_config_file"])
@@ -168,7 +180,14 @@ def build_config(args):
     config["dtype"] = args.dtype
     config["save_interval"] = args.save_interval
 
-    config["paths"]["checkpoint_dir"] = resolve_path(args.checkpoint_dir)
+    checkpoint_dir = args.checkpoint_dir
+    if args.checkpoint_run not in (None, ""):
+        checkpoint_dir = "{}/{}/{}".format(args.checkpoint_dir.rstrip("/\\"), args.exp_name, args.checkpoint_run)
+
+    config["paths"]["checkpoint_dir"] = resolve_path(checkpoint_dir)
+    config["paths"]["checkpoint_run"] = args.checkpoint_run
+    config["paths"]["checkpoint_kind"] = args.checkpoint_kind
+    config["paths"]["checkpoint_value"] = args.checkpoint_value
     config["paths"]["resource_file"] = _resolve_optional_path(args.resource_file)
     config["paths"]["shape_file"] = resolve_path(args.shape_file)
     config["paths"]["agent_config_file"] = resolve_path(args.agent_config_file)
