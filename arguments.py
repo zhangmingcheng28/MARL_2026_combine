@@ -8,15 +8,16 @@ DEFAULT_CONFIG = {
     "seed": 777,
     "device": "auto",
     "dtype": "float32",
-    "mode": "evaluate",  # or evaluate
-    "algorithm": "iddpg",
+    "mode": "train",  # or evaluate
+    "algorithm": "maddpg",  # or maddpg or matd3 or iddpg
     "exp_name": "default_exp",
     "save_interval": 1000,
     "paths": {
         "project_root": str(PROJECT_ROOT),
         "resource_env_var": DEFAULT_RESOURCE_ENV_VAR,
         "checkpoint_dir": "checkpoints",
-        "checkpoint_run": "240326_03_18_20",
+        # "checkpoint_run": "060426_06_30_57",  # this is for evaluation
+        "checkpoint_run": None,  # this is actually also used for training folder saving, training just use None
         "checkpoint_kind": "ep",
         "checkpoint_value": 10000,
         "resource_file": None,
@@ -28,6 +29,7 @@ DEFAULT_CONFIG = {
         "n_agents": 8,
         "action_dim": 2,
         "max_steps": 100,
+        "nearest_neighbor_count": 3,
         "grid_obs_shape": [7, 7],
         "bound": [455, 680, 255, 385],
         "max_x": 1800,
@@ -35,15 +37,16 @@ DEFAULT_CONFIG = {
         "grid_length": 10,
         "acc_max": 8,
         "max_speed": 5,
-        "neighbour_search_distance": 10000,
+        "neighbour_search_distance": 100000,
         "full_observable_critic": False,
         "evaluation_by_episode": False,
     },
     "train": {
         "num_episodes": 20000,
         "total_steps": 2000000,
+        "num_parallel_envs": 1,
         "stop_mode": "episode",  # or "step"
-        "batch_size": 512,
+        "batch_size": 12,
         "buffer_size": int(1e5),
         "actor_lr": 0.0001,
         "critic_lr": 0.0001,
@@ -70,7 +73,7 @@ DEFAULT_CONFIG = {
         "use_gru": False,
         "use_single_portion_selfatt": False,
         "use_selfatt_with_radar": False,
-        "use_all_neigh_with_radar": True,
+        "use_all_neigh_with_radar": True,  # for iddpg only, keep it, other wise training will fail
         "own_obs_only": False,
 
     },
@@ -107,6 +110,7 @@ def get_args():
     parser.add_argument("--obs_dim", type=int, default=None)
     parser.add_argument("--action_dim", type=int, default=DEFAULT_CONFIG["env"]["action_dim"])
     parser.add_argument("--max_steps", type=int, default=DEFAULT_CONFIG["env"]["max_steps"])
+    parser.add_argument("--nearest_neighbor_count", type=int, default=DEFAULT_CONFIG["env"]["nearest_neighbor_count"])
     parser.add_argument("--max_x", type=int, default=DEFAULT_CONFIG["env"]["max_x"])
     parser.add_argument("--max_y", type=int, default=DEFAULT_CONFIG["env"]["max_y"])
     parser.add_argument("--grid_length", type=int, default=DEFAULT_CONFIG["env"]["grid_length"])
@@ -117,6 +121,7 @@ def get_args():
 
     parser.add_argument("--num_episodes", type=int, default=DEFAULT_CONFIG["train"]["num_episodes"])
     parser.add_argument("--total_steps", type=int, default=DEFAULT_CONFIG["train"]["total_steps"])
+    parser.add_argument("--num_parallel_envs", type=int, default=DEFAULT_CONFIG["train"]["num_parallel_envs"])
     parser.add_argument(
         "--stop_mode",
         type=str,
@@ -196,6 +201,7 @@ def build_config(args):
     config["env"]["n_agents"] = args.n_agents
     config["env"]["action_dim"] = args.action_dim
     config["env"]["max_steps"] = args.max_steps
+    config["env"]["nearest_neighbor_count"] = max(0, int(args.nearest_neighbor_count))
     config["env"]["grid_obs_shape"] = list(args.grid_obs_shape)
     config["env"]["bound"] = list(args.bound)
     config["env"]["acc_max"] = args.acc_max
@@ -204,6 +210,7 @@ def build_config(args):
 
     config["train"]["num_episodes"] = args.num_episodes
     config["train"]["total_steps"] = args.total_steps
+    config["train"]["num_parallel_envs"] = max(1, int(args.num_parallel_envs))
     config["train"]["stop_mode"] = args.stop_mode
     config["train"]["batch_size"] = args.batch_size
     config["train"]["buffer_size"] = args.buffer_size
@@ -238,10 +245,12 @@ def build_config(args):
 
     config["eval"]["episodes"] = args.eval_episodes
 
-    if args.algo in ("maddpg", "matd3"):
+    if args.algo == "matd3":
         if args.obs_dim is None:
-            raise ValueError("--obs_dim is required when --algo is 'maddpg' or 'matd3'.")
+            raise ValueError("--obs_dim is required when --algo is 'matd3'.")
         config["env"]["obs_dim"] = args.obs_dim
+    elif args.algo == "maddpg":
+        config["env"].pop("obs_dim", None)
     else:
         config["env"].pop("obs_dim", None)
 

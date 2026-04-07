@@ -80,6 +80,7 @@ class SharedMultiAgentEnv:
         self.evaluation_by_episode = evaluation_by_episode
         self.flags = flags or {}
         self.mode = mode
+        self.nearest_neighbor_count = 0
         self.step_count = 0
         self.episode_count = 0
 
@@ -195,6 +196,7 @@ class SharedMultiAgentEnv:
             flags=deepcopy(config.get("flags", {})),
             mode=config.get("mode", "train"),
         )
+        env.nearest_neighbor_count = max(0, int(env_cfg.get("nearest_neighbor_count", 0)))
         world_map, building_polygons, all_grid_poly = env.gridify_env()
         env.world_map_2D = world_map
         env.buildingPolygons = building_polygons
@@ -772,6 +774,18 @@ class SharedMultiAgentEnv:
                                                                          agent.vel[0], agent.vel[1],
                                                                          agent.protectiveBound])
         return cur_agent.surroundingNeighbor
+
+    def _get_observation_neighbors(self, agent):
+        max_neighbors = int(getattr(self, "nearest_neighbor_count", 0) or 0)
+        if max_neighbors <= 0:
+            return list(agent.surroundingNeighbor.items())
+        return list(agent.surroundingNeighbor.items())[:max_neighbors]
+
+    def _get_observation_neighbor_capacity(self):
+        configured_count = int(getattr(self, "nearest_neighbor_count", 0) or 0)
+        if configured_count <= 0:
+            return len(self.all_uavs) - 1
+        return min(configured_count, len(self.all_uavs) - 1)
 
     def cur_state_norm_state_v3(self, agentRefer_dict, full_observable_critic_flag):
         overall = []
@@ -1409,6 +1423,7 @@ class SharedMultiAgentEnv:
             p2_norm_just_neighbour = []
             nearest_neight = []
             norm_nearest_neigh = []
+            observation_neighbors = self._get_observation_neighbors(agent)
             # filling term for no surrounding agent detected
             pre_total_possible_conflict = 0  # total possible conflict between the host drone and the current neighbour
             cur_total_possible_conflict = 0  # total possible conflict between the host drone and the current neighbour
@@ -1417,8 +1432,8 @@ class SharedMultiAgentEnv:
             d_tcpa = -10
             pre_d_tcpa = -10
             include_neigh_count = 0
-            if len(agent.surroundingNeighbor) > 0:  # meaning there is surrounding neighbors around the current agent
-                for other_agentIdx, other_agent in agent.surroundingNeighbor.items():
+            if len(observation_neighbors) > 0:  # meaning there is surrounding neighbors around the current agent
+                for other_agentIdx, other_agent in observation_neighbors:
                     if other_agentIdx != agent_idx:
                         nei_px = self.all_uavs[other_agentIdx].pos[0]
                         nei_py = self.all_uavs[other_agentIdx].pos[1]
@@ -1522,15 +1537,17 @@ class SharedMultiAgentEnv:
                 overall_state_p3.append([np.zeros((1, 6))])
                 norm_overall_state_p3.append([np.zeros((1, 6))])
 
-            max_neigh_count = len(self.all_uavs) - 1
-            filling_required = max_neigh_count - len(agent.surroundingNeighbor)
+            max_neigh_count = self._get_observation_neighbor_capacity()
+            filling_required = max_neigh_count - len(observation_neighbors)
             # filling_value = -2
             filling_value = 0
             # filling_dim = 5
-            filling_dim = 4
+            filling_dim = 5
             for _ in range(filling_required):
                 p1_other_agents.append(np.array([filling_value] * filling_dim))
                 p1_norm_other_agents.append(np.array([filling_value] * filling_dim))
+                p2_just_neighbour.append(np.array([filling_value] * filling_dim))
+                p2_norm_just_neighbour.append(np.array([filling_value] * filling_dim))
             all_other_agents = np.concatenate(p1_other_agents)
             norm_all_other_agents = np.concatenate(p1_norm_other_agents)
 
