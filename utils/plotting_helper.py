@@ -12,6 +12,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
+import matplotlib.patheffects as patheffects
 from utils.env_simulator_helper import shapelypoly_to_matpoly
 from matplotlib.markers import MarkerStyle
 from matplotlib.transforms import Affine2D
@@ -46,6 +47,241 @@ def _resolve_aircraft_image_path(env):
                 return matches[0]
 
     raise FileNotFoundError("No aircraft PNG was found under the project's resources directory.")
+
+
+def _resolve_sprite_image_path(env, explicit_path=None):
+    if explicit_path is not None:
+        candidate = Path(explicit_path)
+        if candidate.exists():
+            return candidate
+
+    for attr_name in (
+        "gif_sprite_texture_path",
+        "occupied_poly_texture_path",
+        "destination_marker_texture_path",
+        "start_marker_texture_path",
+    ):
+        candidate = getattr(env, attr_name, None)
+        if candidate is None:
+            continue
+        candidate_path = Path(candidate)
+        if candidate_path.exists():
+            return candidate_path
+
+    return _resolve_aircraft_image_path(env)
+
+
+def _resolve_role_sprite_path(env, attr_name, explicit_path=None, fallback_attr_names=()):
+    if explicit_path is not None:
+        candidate = Path(explicit_path)
+        if candidate.exists():
+            return candidate
+
+    candidate = getattr(env, attr_name, None)
+    if candidate is not None:
+        candidate_path = Path(candidate)
+        if candidate_path.exists():
+            return candidate_path
+
+    for fallback_attr_name in fallback_attr_names:
+        fallback_candidate = getattr(env, fallback_attr_name, None)
+        if fallback_candidate is None:
+            continue
+        fallback_path = Path(fallback_candidate)
+        if fallback_path.exists():
+            return fallback_path
+
+    return _resolve_aircraft_image_path(env)
+
+
+def _crop_rgba_to_foreground(rgba_img, alpha_threshold=1e-3):
+    foreground = rgba_img[..., 3] > alpha_threshold
+    if not np.any(foreground):
+        return rgba_img
+
+    row_idx, col_idx = np.where(foreground)
+    min_row, max_row = row_idx.min(), row_idx.max()
+    min_col, max_col = col_idx.min(), col_idx.max()
+    return rgba_img[min_row:max_row + 1, min_col:max_col + 1, :]
+
+
+def _load_sprite_rgba(sprite_path, alpha=1.0, neutral_tolerance=0.10, light_background_threshold=0.72):
+    sprite_img = Image.open(str(sprite_path)).convert("RGBA")
+    rgba_img = np.asarray(sprite_img).astype(np.float32) / 255.0
+
+    rgb = rgba_img[..., :3]
+    source_alpha = rgba_img[..., 3]
+
+    # Remove border-connected bright neutral background for JPG-like assets,
+    # but preserve already-transparent PNG foreground.
+    brightness = rgb.mean(axis=-1)
+    chroma = rgb.max(axis=-1) - rgb.min(axis=-1)
+    candidate_background = (
+        (source_alpha > 1e-3)
+        & (brightness >= light_background_threshold)
+        & (chroma <= neutral_tolerance)
+    )
+
+    background_mask = np.zeros(candidate_background.shape, dtype=bool)
+    visited = np.zeros(candidate_background.shape, dtype=bool)
+    height, width = candidate_background.shape
+    stack = []
+
+    for x in range(width):
+        stack.append((0, x))
+        stack.append((height - 1, x))
+    for y in range(1, height - 1):
+        stack.append((y, 0))
+        stack.append((y, width - 1))
+
+    while stack:
+        y, x = stack.pop()
+        if visited[y, x]:
+            continue
+        visited[y, x] = True
+        if not candidate_background[y, x]:
+            continue
+
+        background_mask[y, x] = True
+        if y > 0:
+            stack.append((y - 1, x))
+        if y < height - 1:
+            stack.append((y + 1, x))
+        if x > 0:
+            stack.append((y, x - 1))
+        if x < width - 1:
+            stack.append((y, x + 1))
+
+    alpha_channel = source_alpha * (~background_mask).astype(np.float32) * alpha
+    rgba_result = np.dstack((rgb, alpha_channel))
+    return _crop_rgba_to_foreground(rgba_result)
+
+
+def _draw_sprite_clipped_to_polygon(ax, sprite_rgba, polygon, alpha=1.0, zorder=1.0, outline_color=None, outline_alpha=0.35):
+    sprite_with_alpha = sprite_rgba.copy()
+    sprite_with_alpha[..., 3] *= alpha
+
+    min_x, min_y, max_x, max_y = polygon.bounds
+    clip_patch = shapelypoly_to_matpoly(polygon, True, "none")
+    clip_patch.set_transform(ax.transData)
+    ax.imshow(
+        sprite_with_alpha,
+        extent=(min_x, max_x, min_y, max_y),
+        interpolation="bilinear",
+        clip_path=clip_patch,
+        clip_on=True,
+        zorder=zorder,
+    )
+
+    if outline_color is not None:
+        outline_patch = shapelypoly_to_matpoly(polygon, False, outline_color)
+        outline_patch.set_facecolor("none")
+        outline_patch.set_linewidth(0.3)
+        outline_patch.set_alpha(outline_alpha)
+        outline_patch.set_zorder(zorder + 0.05)
+        ax.add_patch(outline_patch)
+
+
+def _draw_centered_sprite(ax, sprite_rgba, x, y, radius, alpha=1.0, zorder=3.0):
+    if radius <= 0:
+        return
+
+    sprite_with_alpha = sprite_rgba.copy()
+    sprite_with_alpha[..., 3] *= alpha
+    height, width = sprite_with_alpha.shape[:2]
+    aspect_ratio = width / float(height)
+    half_height = radius
+    half_width = radius * aspect_ratio
+
+    ax.imshow(
+        sprite_with_alpha,
+        extent=(x - half_width, x + half_width, y - half_height, y + half_height),
+        interpolation="bilinear",
+        zorder=zorder,
+    )
+
+
+def _style_plot_axes(ax, env):
+    ax.axis("equal")
+    ax.set_xlim(env.bound[0], env.bound[1])
+    ax.set_ylim(env.bound[2], env.bound[3])
+    ax.tick_params(left=False, bottom=False, labelleft=False, labelbottom=False)
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+
+
+def _animate_sprite_frame(frame_num, ax, env, trajectory_eachPlay, occupied_sprite_rgba, destination_sprite_rgba, start_sprite_rgba):
+    ax.clear()
+    _style_plot_axes(ax, env)
+
+    for one_poly in env.world_map_2D_polyList[0][0]:
+        _draw_sprite_clipped_to_polygon(
+            ax,
+            occupied_sprite_rgba,
+            one_poly,
+            alpha=0.18,
+            zorder=0.8,
+            outline_color="#d8cf6a",
+            outline_alpha=0.4,
+        )
+
+    for poly in env.buildingPolygons:
+        matp_poly = shapelypoly_to_matpoly(poly, False, "red")
+        matp_poly.set_facecolor("#c62828")
+        matp_poly.set_alpha(0.6)
+        matp_poly.set_linewidth(1.0)
+        matp_poly.set_zorder(1.0)
+        ax.add_patch(matp_poly)
+
+    for agent_idx, agent in env.all_uavs.items():
+        goal_x, goal_y = agent.goal[-1]
+        _draw_centered_sprite(
+            ax,
+            destination_sprite_rgba,
+            goal_x,
+            goal_y,
+            radius=env.grid_length * 0.5,
+            alpha=0.9,
+            zorder=2.2,
+        )
+        goal_label = ax.text(
+            goal_x,
+            goal_y + env.grid_length * 0.35,
+            str(agent_idx),
+            ha="center",
+            va="center",
+            color="white",
+            fontsize=6,
+            fontweight="bold",
+            zorder=2.3,
+        )
+        goal_label.set_path_effects([patheffects.withStroke(linewidth=1.8, foreground="black")])
+
+    for agent_idx, agent_state in enumerate(trajectory_eachPlay[frame_num]):
+        x, y = agent_state[0], agent_state[1]
+        _draw_centered_sprite(
+            ax,
+            start_sprite_rgba,
+            x,
+            y,
+            radius=env.all_uavs[agent_idx].protectiveBound,
+            alpha=0.95,
+            zorder=3.0,
+        )
+        agent_label = ax.text(
+            x,
+            y + env.all_uavs[agent_idx].protectiveBound + 1.0,
+            str(agent_idx),
+            ha="center",
+            va="center",
+            color="#4dd0e1",
+            fontsize=6,
+            fontweight="bold",
+            zorder=3.1,
+        )
+        agent_label.set_path_effects([patheffects.withStroke(linewidth=1.8, foreground="black")])
+
+    return ax.images + ax.patches + ax.texts
 
 
 def animate(frame_num, ax, env, trajectory_eachPlay):
@@ -168,6 +404,59 @@ def save_gif(env, trajectory_eachPlay, pre_fix, episode_to_check, episode):
     ani.save(gif_path, writer='pillow')
 
     # Close figure
+    plt.close(fig)
+
+
+def save_sprite_gif(
+    env,
+    trajectory_eachPlay,
+    output_path,
+    sprite_image_path=None,
+    destination_sprite_image_path=None,
+    start_sprite_image_path=None,
+    interval_ms=300,
+):
+    if not trajectory_eachPlay:
+        raise ValueError("trajectory_eachPlay is empty, cannot render GIF.")
+
+    os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+    occupied_sprite_path = _resolve_role_sprite_path(
+        env,
+        "occupied_poly_texture_path",
+        explicit_path=sprite_image_path,
+        fallback_attr_names=("gif_sprite_texture_path", "destination_marker_texture_path", "start_marker_texture_path"),
+    )
+    destination_sprite_path = _resolve_role_sprite_path(
+        env,
+        "destination_marker_texture_path",
+        explicit_path=destination_sprite_image_path,
+        fallback_attr_names=("occupied_poly_texture_path", "gif_sprite_texture_path", "start_marker_texture_path"),
+    )
+    start_sprite_path = _resolve_role_sprite_path(
+        env,
+        "start_marker_texture_path",
+        explicit_path=start_sprite_image_path,
+        fallback_attr_names=("occupied_poly_texture_path", "gif_sprite_texture_path", "destination_marker_texture_path"),
+    )
+
+    occupied_sprite_rgba = _load_sprite_rgba(occupied_sprite_path, alpha=1.0)
+    destination_sprite_rgba = _load_sprite_rgba(destination_sprite_path, alpha=1.0)
+    start_sprite_rgba = _load_sprite_rgba(start_sprite_path, alpha=1.0)
+
+    fig, ax = plt.subplots(1, 1)
+    _style_plot_axes(ax, env)
+
+    ani = animation.FuncAnimation(
+        fig,
+        _animate_sprite_frame,
+        fargs=(ax, env, trajectory_eachPlay, occupied_sprite_rgba, destination_sprite_rgba, start_sprite_rgba),
+        frames=len(trajectory_eachPlay),
+        interval=interval_ms,
+        blit=False,
+    )
+
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    ani.save(output_path, writer="pillow")
     plt.close(fig)
 
 

@@ -10,6 +10,7 @@ def _extract_agent_snapshot(env):
         snapshot.append({
             "agent_idx": agent_idx,
             "agent_name": agent.agent_name,
+            "map_idx": env.current_random_map_idx,
             "pos": tuple(agent.pos.tolist()),
             "ini_pos": tuple(agent.ini_pos),
             "goal": [tuple(point) for point in agent.goal],
@@ -75,6 +76,16 @@ class SubprocVecEnv:
     def step_at(self, env_idx, actions):
         self._remotes[env_idx].send(("step", actions))
         return self._remotes[env_idx].recv()
+
+    def step_async(self, env_indices, actions_batch):
+        for env_idx, actions in zip(env_indices, actions_batch):
+            self._remotes[env_idx].send(("step", actions))
+
+    def step_wait(self, env_indices):
+        results = []
+        for env_idx in env_indices:
+            results.append(self._remotes[env_idx].recv())  # the main process “Pause here until data arrives from that worker.”
+        return results
 
     def close(self):
         for remote in self._remotes:

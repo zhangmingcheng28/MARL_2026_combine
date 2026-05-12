@@ -4,20 +4,15 @@ from copy import deepcopy
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.optim as optim
 
 from agents.base_trainer import BaseTrainer
 from agents.common.utils import soft_update
 from agents.iddpg.buffer import Experience, ReplayMemory
-from agents.iddpg.networks import (
-    ActorNetworkAllNeiWRadar,
-    AttentionCriticSingleTwoPortionWRadar,
-    CriticSingleTwoPortionWRadar,
-)
+from agents.fm_iddpg.networks import FMActorNetworkAllNeiWRadar, FMCriticSingleTwoPortionWRadar
 
 
-class IDDPGTrainer(BaseTrainer):
+class FMIDDPGTrainer(BaseTrainer):
     def __init__(self, config):
         super().__init__(config)
 
@@ -34,6 +29,7 @@ class IDDPGTrainer(BaseTrainer):
         self.update_every = config["train"]["update_every"]
         self.flags = config.get("flags", {})
         self.exploration = config.get("exploration", {})
+        self.fm_lambda = float(config["train"].get("feature_matching_lambda", 0.002))
 
         self.actor = None
         self.actor_target = None
@@ -50,17 +46,19 @@ class IDDPGTrainer(BaseTrainer):
 
     def _require_supported_configuration(self):
         if self.flags.get("full_observable_critic"):
-            raise NotImplementedError("Current IDDPG port only supports non-full-observable critic mode.")
+            raise NotImplementedError("FM-iddpg only supports non-full-observable critic mode.")
         if self.flags.get("use_gru"):
-            raise NotImplementedError("Current IDDPG port does not support GRU mode yet.")
+            raise NotImplementedError("FM-iddpg does not support GRU mode.")
         if self.flags.get("use_selfatt_with_radar"):
-            raise NotImplementedError("Current IDDPG port does not support self-attention radar mode yet.")
+            raise NotImplementedError("FM-iddpg does not support self-attention radar mode.")
         if self.flags.get("use_single_portion_selfatt"):
-            raise NotImplementedError("Current IDDPG port does not support single-portion self-attention mode yet.")
+            raise NotImplementedError("FM-iddpg does not support single-portion self-attention mode.")
+        if self.flags.get("use_critic_attention"):
+            raise NotImplementedError("FM-iddpg does not support the attention critic variant.")
         if not self.flags.get("use_all_neigh_with_radar", False):
-            raise NotImplementedError("Current IDDPG port expects use_all_neigh_with_radar=True.")
+            raise NotImplementedError("FM-iddpg expects use_all_neigh_with_radar=True.")
         if self.flags.get("own_obs_only"):
-            raise NotImplementedError("Current IDDPG port does not support own_obs_only mode yet.")
+            raise NotImplementedError("FM-iddpg does not support own_obs_only mode.")
 
     def _extract_dims(self, obs):
         if len(obs) < 3:
@@ -75,14 +73,12 @@ class IDDPGTrainer(BaseTrainer):
         actor_dim = self._extract_dims(obs)
         critic_dim = actor_dim
 
-        self.actor = ActorNetworkAllNeiWRadar(actor_dim, self.action_dim).to(device=self.device, dtype=self.torch_dtype)
+        self.actor = FMActorNetworkAllNeiWRadar(actor_dim, self.action_dim).to(device=self.device, dtype=self.torch_dtype)
         self.actor_target = deepcopy(self.actor).to(device=self.device, dtype=self.torch_dtype)
-        critic_cls = (
-            AttentionCriticSingleTwoPortionWRadar
-            if self.flags.get("use_critic_attention", False)
-            else CriticSingleTwoPortionWRadar
+        self.critic = FMCriticSingleTwoPortionWRadar(critic_dim, self.action_dim).to(
+            device=self.device,
+            dtype=self.torch_dtype,
         )
-        self.critic = critic_cls(critic_dim, self.action_dim).to(device=self.device, dtype=self.torch_dtype)
         self.critic_target = deepcopy(self.critic).to(device=self.device, dtype=self.torch_dtype)
 
         self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=self.config["train"]["actor_lr"])
@@ -121,13 +117,14 @@ class IDDPGTrainer(BaseTrainer):
         actions = []
         with torch.no_grad():
             for i in range(self.n_agents):
-                action = self.actor(
+                action, _ = self.actor(
                     [
                         obs_tensor[i].unsqueeze(0),
                         nei_tensor[i].unsqueeze(0),
                         radar_tensor[i].unsqueeze(0),
                     ]
-                ).cpu().numpy()[0]
+                )
+                action = action.cpu().numpy()[0]
                 if not evaluate:
                     action += np.random.normal(0, self._noise_scale(), size=self.action_dim).astype(self.numpy_dtype)
                 actions.append(np.clip(action, -1.0, 1.0).astype(self.numpy_dtype))
@@ -164,7 +161,6 @@ class IDDPGTrainer(BaseTrainer):
             per_agent_state.append(one_agent_state)
         return per_agent_state
 
-
     def store_transition(self, obs, actions, rewards, next_obs, dones, history=None, cur_hidden=None, next_hidden=None):
         self._ensure_models_initialized(obs)
 
@@ -194,6 +190,9 @@ class IDDPGTrainer(BaseTrainer):
                 None if cur_hidden is None else np.asarray(cur_hidden[i], dtype=self.numpy_dtype),
                 None if next_hidden is None else np.asarray(next_hidden[i], dtype=self.numpy_dtype),
             )
+
+    def compute_feature_matching_loss(self, random_features, clean_features):
+        return nn.functional.mse_loss(random_features, clean_features)
 
     def update(self, i_episode=None, total_step_count=None, single_eps_critic_cal_record=None):
         if self.actor is None:
@@ -227,25 +226,17 @@ class IDDPGTrainer(BaseTrainer):
         reward_batch = torch.tensor(np.array(batch.rewards), dtype=self.torch_dtype, device=self.device)
         action_batch = torch.tensor(np.array(batch.actions), dtype=self.torch_dtype, device=self.device)
 
-        non_final_next_states_actorin = [next_stacked_elem_0, next_stacked_elem_1, next_stacked_elem_2]
-        whole_curren_action = action_batch
-
-        non_final_next_actions = self.actor_target(
-            [
-                non_final_next_states_actorin[0],
-                non_final_next_states_actorin[1],
-                non_final_next_states_actorin[2],
-            ]
+        non_final_next_actions, _ = self.actor_target(
+            [next_stacked_elem_0, next_stacked_elem_1, next_stacked_elem_2]
         )
-        non_final_next_combine_actions = non_final_next_actions
-
-        current_Q = self.critic([stacked_elem_0, stacked_elem_1, stacked_elem_2], action_batch)
+        current_Q, _ = self.critic([stacked_elem_0, stacked_elem_1, stacked_elem_2], action_batch)
 
         with torch.no_grad():
-            next_target_critic_value = self.critic_target(
+            next_target_critic_value, _ = self.critic_target(
                 [next_stacked_elem_0, next_stacked_elem_1, next_stacked_elem_2],
-                non_final_next_combine_actions,
-            ).squeeze()
+                non_final_next_actions,
+            )
+            next_target_critic_value = next_target_critic_value.squeeze()
 
             reward_cal = reward_batch.clone()
             tar_Q_before_rew = self.gamma * next_target_critic_value * (1 - dones_stacked)
@@ -255,23 +246,50 @@ class IDDPGTrainer(BaseTrainer):
 
         loss_Q = nn.MSELoss()(current_Q, target_Q.detach())
         cal_loss_Q = loss_Q.clone()
-        single_eps_critic_cal_record.append([
-            tar_Q_before_rew.detach().cpu().numpy(),
-            reward_cal.detach().cpu().numpy(),
-            tar_Q_after_rew.detach().cpu().numpy(),
-            cal_loss_Q.detach().cpu().numpy(),
-            (tar_Q_before_rew.detach().cpu().numpy().min(), tar_Q_before_rew.detach().cpu().numpy().max()),
-            (reward_cal.detach().cpu().numpy().min(), reward_cal.detach().cpu().numpy().max()),
-            (tar_Q_after_rew.detach().cpu().numpy().min(), tar_Q_after_rew.detach().cpu().numpy().max()),
-            (cal_loss_Q.detach().cpu().numpy().min(), cal_loss_Q.detach().cpu().numpy().max()),
-        ])
+        single_eps_critic_cal_record.append(
+            [
+                tar_Q_before_rew.detach().cpu().numpy(),
+                reward_cal.detach().cpu().numpy(),
+                tar_Q_after_rew.detach().cpu().numpy(),
+                cal_loss_Q.detach().cpu().numpy(),
+                (tar_Q_before_rew.detach().cpu().numpy().min(), tar_Q_before_rew.detach().cpu().numpy().max()),
+                (reward_cal.detach().cpu().numpy().min(), reward_cal.detach().cpu().numpy().max()),
+                (tar_Q_after_rew.detach().cpu().numpy().min(), tar_Q_after_rew.detach().cpu().numpy().max()),
+                (cal_loss_Q.detach().cpu().numpy().min(), cal_loss_Q.detach().cpu().numpy().max()),
+            ]
+        )
+
+        _, critic_features_random = self.critic(
+            [stacked_elem_0, stacked_elem_1, stacked_elem_2],
+            action_batch,
+            use_random=True,
+        )
+        _, critic_features_clean = self.critic(
+            [stacked_elem_0, stacked_elem_1, stacked_elem_2],
+            action_batch,
+            use_random=False,
+        )
+        fm_loss_critic = self.compute_feature_matching_loss(critic_features_random, critic_features_clean)
+        loss_Q = loss_Q + self.fm_lambda * fm_loss_critic
+
         self.critic_optimizer.zero_grad()
         loss_Q.backward()
         self.critic_optimizer.step()
 
-        action_i = self.actor([stacked_elem_0, stacked_elem_1, stacked_elem_2])
-        ac = action_i.squeeze(0)
-        actor_loss = -self.critic([stacked_elem_0, stacked_elem_1, stacked_elem_2], ac).mean()
+        action_i, _ = self.actor([stacked_elem_0, stacked_elem_1, stacked_elem_2])
+        actor_loss, _ = self.critic([stacked_elem_0, stacked_elem_1, stacked_elem_2], action_i)
+        actor_loss = -(actor_loss.mean())
+
+        _, actor_features_random = self.actor(
+            [stacked_elem_0, stacked_elem_1, stacked_elem_2],
+            use_random=True,
+        )
+        _, actor_features_clean = self.actor(
+            [stacked_elem_0, stacked_elem_1, stacked_elem_2],
+            use_random=False,
+        )
+        fm_loss_actor = self.compute_feature_matching_loss(actor_features_random, actor_features_clean)
+        actor_loss = actor_loss + self.fm_lambda * fm_loss_actor
 
         if self.flags.get("transfer_learning", False):
             if i_episode > 10000:
@@ -304,24 +322,24 @@ class IDDPGTrainer(BaseTrainer):
             raise ValueError("Unsupported stop_mode: {}. Expected 'step' or 'episode'.".format(stop_mode))
 
         os.makedirs(path, exist_ok=True)
-        actor_path = os.path.join(path, "iddpg_actor.pt")
-        critic_path = os.path.join(path, "iddpg_critic.pt")
+        actor_path = os.path.join(path, "fm_iddpg_actor.pt")
+        critic_path = os.path.join(path, "fm_iddpg_critic.pt")
         torch.save(self.actor.state_dict(), actor_path)
         torch.save(self.critic.state_dict(), critic_path)
 
         if episode is not None:
-            torch.save(self.actor.state_dict(), os.path.join(path, "iddpg_actor_ep{}.pt".format(int(episode))))
-            torch.save(self.critic.state_dict(), os.path.join(path, "iddpg_critic_ep{}.pt".format(int(episode))))
+            torch.save(self.actor.state_dict(), os.path.join(path, "fm_iddpg_actor_ep{}.pt".format(int(episode))))
+            torch.save(self.critic.state_dict(), os.path.join(path, "fm_iddpg_critic_ep{}.pt".format(int(episode))))
         if step is not None:
-            torch.save(self.actor.state_dict(), os.path.join(path, "iddpg_actor_step{}.pt".format(int(step))))
-            torch.save(self.critic.state_dict(), os.path.join(path, "iddpg_critic_step{}.pt".format(int(step))))
+            torch.save(self.actor.state_dict(), os.path.join(path, "fm_iddpg_actor_step{}.pt".format(int(step))))
+            torch.save(self.critic.state_dict(), os.path.join(path, "fm_iddpg_critic_step{}.pt".format(int(step))))
 
     def _load_state(self, path, checkpoint_tag=None):
-        actor_name = "iddpg_actor.pt"
-        critic_name = "iddpg_critic.pt"
+        actor_name = "fm_iddpg_actor.pt"
+        critic_name = "fm_iddpg_critic.pt"
         if checkpoint_tag:
-            actor_name = f"iddpg_actor_{checkpoint_tag}.pt"
-            critic_name = f"iddpg_critic_{checkpoint_tag}.pt"
+            actor_name = f"fm_iddpg_actor_{checkpoint_tag}.pt"
+            critic_name = f"fm_iddpg_critic_{checkpoint_tag}.pt"
 
         actor_path = os.path.join(path, actor_name)
         critic_path = os.path.join(path, critic_name)

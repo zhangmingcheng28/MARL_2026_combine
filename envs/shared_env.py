@@ -3,10 +3,13 @@ from argparse import Namespace
 from importlib import util
 from pathlib import Path
 from typing import Optional
-from config.paths import resolve_path
+from config.paths import PROJECT_ROOT, resolve_path
 from utils.env_simulator_helper import *
 import matplotlib.pyplot as plt
 import matplotlib
+import matplotlib.image as mpimg
+import matplotlib.patheffects as patheffects
+from matplotlib.patches import Circle
 from matplotlib.markers import MarkerStyle
 from matplotlib.transforms import Affine2D
 import copy
@@ -15,6 +18,7 @@ from envs.uav import UAV
 from utils.jps_straight import jps_find_path
 import warnings
 import os
+import pickle
 
 import geopandas as gpd
 import pandas as pd
@@ -29,6 +33,25 @@ from collections import OrderedDict
 import time
 
 
+PRECOMPUTED_MAP_BOUNDS = {
+    0: [230, 530, 1000, 1200],
+    1: [870, 1170, 830, 1030],
+    2: [100, 400, 500, 700],
+    3: [455, 680, 255, 385],
+    4: [300, 600, 500, 700],
+    5: [530, 860, 650, 850],
+    6: [350, 650, 150, 350],
+    7: [550, 850, 300, 500],
+    8: [640, 940, 580, 780],
+    9: [750, 1050, 150, 350],
+    10: [880, 1180, 400, 600],
+    11: [900, 1200, 500, 700],
+    12: [930, 1230, 80, 280],
+    13: [1500, 1800, 300, 500],
+    14: [280, 580, 0, 200],
+}
+
+
 class SharedMultiAgentEnv:
     def __init__(
             self,
@@ -38,6 +61,7 @@ class SharedMultiAgentEnv:
             resource_file: Optional[str] = None,
             shape_file: Optional[str] = None,
             agent_config_file: Optional[str] = None,
+            map_bundle_dir: Optional[str] = None,
             legacy_code_dir: Optional[str] = None,
             gamma: float = 0.99,
             tau: float = 0.005,
@@ -55,6 +79,7 @@ class SharedMultiAgentEnv:
             evaluation_by_episode: bool = False,
             flags: Optional[dict] = None,
             mode: str = "train",
+            random_map_idx=3,
     ):
         self.n_agents = n_agents
         self.action_dim = action_dim
@@ -68,6 +93,7 @@ class SharedMultiAgentEnv:
         self.resource_file = resource_file
         self.shape_file = shape_file
         self.agent_config_file = agent_config_file
+        self.map_bundle_dir = Path(map_bundle_dir) if map_bundle_dir else None
         self.legacy_code_dir = legacy_code_dir
         self.bound = bound or []
         self.max_x = max_x
@@ -83,18 +109,36 @@ class SharedMultiAgentEnv:
         self.nearest_neighbor_count = 0
         self.step_count = 0
         self.episode_count = 0
+        self.requested_random_map_idx = random_map_idx
+        self.current_random_map_idx = None
+        self._using_precomputed_maps = False
 
         self.world_map_2D = None  # 2D binary matrix, in ndarray form.
         self.world_map_2D_jps = None
+        self.world_map_2D_collection = {}
+        self.world_map_2D_jps_collection = {}
         self.centroid_to_position_empty = {}
         self.centroid_to_position_occupied = {}
+        self.centroid_to_position_empty_collection = {}
+        self.centroid_to_position_occupied_collection = {}
         self.world_map_2D_polyList = None
+        self.world_map_2D_polyList_collection = {}
         self.buildingPolygons = None  # contain all polygon in the world that has building
         self.world_STRtree = None  # contains all polygon in the environment
+        self.world_STRtree_collection = {}
         self.all_buildingSTR = None
+        self.all_buildingSTR_collection = {}
         self.all_buildingSTR_wBound = None
+        self.all_buildingSTR_wBound_collection = {}
         self.all_building_centre = None
+        self.all_building_centre_collection = {}
         self.list_of_occupied_grid_wBound = None
+        self.list_of_occupied_grid_wBound_collection = {}
+        self.bound_collection = {}
+        self.target_pool_collection = {}
+        self.cropped_coord_match_actual_coord = {}
+        self.cropped_to_actual = {}
+        self.actual_to_cropped = {}
         self.global_time = 0.0  # in sec
         self.time_step = 0.5  # in second as well
         self.all_uavs = None
@@ -124,11 +168,20 @@ class SharedMultiAgentEnv:
         self._legacy_args = Namespace(mode=self.mode, episode_length=self.max_steps)
         self._legacy_backend = None
         self._simulator = None
+        resources_dir = PROJECT_ROOT / "resources"
+        self.occupied_poly_texture_path = resources_dir / "pitfall-removebg.png"
+        self._occupied_poly_texture_rgba = None
+        self.destination_marker_texture_path = resources_dir / "treasure-removebg.png"
+        self._destination_marker_texture_rgba = None
+        self.start_marker_texture_path = resources_dir / "AI_bot.png"
+        self._start_marker_texture_rgba = None
 
         if self.resource_file is not None and not Path(self.resource_file).exists():
             raise FileNotFoundError(f"Environment resource file does not exist: {self.resource_file}")
         if self.shape_file is not None and not Path(self.shape_file).exists():
             raise FileNotFoundError(f"Environment shape file does not exist: {self.shape_file}")
+        if self.map_bundle_dir is not None and not self.map_bundle_dir.exists():
+            raise FileNotFoundError(f"Precomputed map bundle directory does not exist: {self.map_bundle_dir}")
         # if self.agent_config_file is not None and not Path(self.agent_config_file).exists():
         #     raise FileNotFoundError(f"Environment agent config file does not exist: {self.agent_config_file}")
 
@@ -159,13 +212,17 @@ class SharedMultiAgentEnv:
         train_cfg = config.get("train", {})
         exploration_cfg = config.get("exploration", {})
 
-        shape_file = paths_cfg.get("shape_file")
-        if shape_file:
-            shape_file = resolve_path(shape_file)
-
         agent_config_file = paths_cfg.get("agent_config_file")
         if agent_config_file:
             agent_config_file = resolve_path(agent_config_file)
+
+        shape_file = paths_cfg.get("shape_file")
+        map_bundle_dir = paths_cfg.get("map_bundle_dir")
+        if map_bundle_dir:
+            map_bundle_dir = resolve_path(map_bundle_dir)
+            shape_file = None
+        elif shape_file:
+            shape_file = resolve_path(shape_file)
 
         legacy_code_dir = paths_cfg.get("legacy_code_dir")
         if legacy_code_dir:
@@ -178,6 +235,7 @@ class SharedMultiAgentEnv:
             resource_file=env_cfg.get("resource_file"),
             shape_file=shape_file,
             agent_config_file=agent_config_file,
+            map_bundle_dir=map_bundle_dir,
             legacy_code_dir=legacy_code_dir,
             gamma=train_cfg.get("gamma", 0.99),
             tau=train_cfg.get("tau", 0.005),
@@ -195,15 +253,379 @@ class SharedMultiAgentEnv:
             evaluation_by_episode=env_cfg.get("evaluation_by_episode", False),
             flags=deepcopy(config.get("flags", {})),
             mode=config.get("mode", "train"),
+            random_map_idx=env_cfg.get("random_map_idx", 3),
         )
         env.nearest_neighbor_count = max(0, int(env_cfg.get("nearest_neighbor_count", 0)))
-        world_map, building_polygons, all_grid_poly = env.gridify_env()
-        env.world_map_2D = world_map
-        env.buildingPolygons = building_polygons
-        env.world_map_2D_polyList = all_grid_poly
+        if env.map_bundle_dir is not None:
+            env._load_precomputed_map_bundle()
+        else:
+            world_map, building_polygons, all_grid_poly = env.gridify_env()
+            env.world_map_2D = world_map
+            env.buildingPolygons = building_polygons
+            env.world_map_2D_polyList = all_grid_poly
         env.create_world()
         env.search_distance = config["env"]["neighbour_search_distance"]
         return env
+
+    def _derive_bounds_from_coord_mapping(self, coord_mapping):
+        values = np.asarray(list(coord_mapping.values()), dtype=np.float64)
+        return [
+            int(values[:, 0].min()),
+            int(values[:, 0].max()),
+            int(values[:, 1].min()),
+            int(values[:, 1].max()),
+        ]
+
+    def _build_target_pool_for_map(self, bound, non_occupied_polygon):
+        target_area1, target_area2, target_area3, target_area4 = [], [], [], []
+        target_pool = [target_area1, target_area2, target_area3, target_area4]
+        x_segment = (bound[1] - bound[0]) / 2 + bound[0]
+        y_segment = (bound[3] - bound[2]) / 2 + bound[2]
+        x_left_bound = LineString([(bound[0], -9999), (bound[0], 9999)])
+        x_right_bound = LineString([(bound[1], -9999), (bound[1], 9999)])
+        y_bottom_bound = LineString([(-9999, bound[2]), (9999, bound[2])])
+        y_top_bound = LineString([(-9999, bound[3]), (9999, bound[3])])
+        boundary_lines = [x_left_bound, x_right_bound, y_bottom_bound, y_top_bound]
+
+        for poly in non_occupied_polygon:
+            centre_coord = (poly.centroid.x, poly.centroid.y)
+            centre_coord_pt = Point(poly.centroid.x, poly.centroid.y)
+            intersects_any_boundary = any(line.intersects(centre_coord_pt) for line in boundary_lines)
+            if intersects_any_boundary:
+                continue
+            if centre_coord[0] < x_segment and centre_coord[1] < y_segment:
+                target_area1.append(centre_coord)
+            elif centre_coord[0] > x_segment and centre_coord[1] < y_segment:
+                target_area2.append(centre_coord)
+            elif centre_coord[0] > x_segment and centre_coord[1] > y_segment:
+                target_area3.append(centre_coord)
+            else:
+                target_area4.append(centre_coord)
+        return target_pool
+
+    def _load_precomputed_map_bundle(self):
+        required_files = {
+            "bound_allGridPoly": self.map_bundle_dir / "bound_allGridPoly.pickle",
+            "bound_world_map": self.map_bundle_dir / "bound_world_map.pickle",
+            "whole_map_polygon": self.map_bundle_dir / "whole_map_polygon.pickle",
+            "cropped_coord_match_actual_coord": self.map_bundle_dir / "cropped_coord_match_actual_coord.pickle",
+        }
+        for label, path in required_files.items():
+            if not path.exists():
+                raise FileNotFoundError(f"Missing precomputed map bundle file '{label}': {path}")
+
+        with open(required_files["bound_allGridPoly"], "rb") as handle:
+            self.world_map_2D_polyList_collection = pickle.load(handle)
+        with open(required_files["bound_world_map"], "rb") as handle:
+            self.world_map_2D_collection = pickle.load(handle)
+        with open(required_files["whole_map_polygon"], "rb") as handle:
+            self.buildingPolygons = pickle.load(handle)
+        with open(required_files["cropped_coord_match_actual_coord"], "rb") as handle:
+            self.cropped_coord_match_actual_coord = pickle.load(handle)
+
+        missing_bounds = sorted(set(self.cropped_coord_match_actual_coord.keys()) - set(PRECOMPUTED_MAP_BOUNDS.keys()))
+        if missing_bounds:
+            raise KeyError(
+                "Missing canonical precomputed bounds for map indices: {}".format(missing_bounds)
+            )
+        self.bound_collection = {
+            map_idx: list(PRECOMPUTED_MAP_BOUNDS[map_idx])
+            for map_idx in sorted(self.cropped_coord_match_actual_coord.keys())
+        }
+        self._using_precomputed_maps = True
+
+    def _resolve_map_index(self, requested_idx=None):
+        if not self.bound_collection:
+            return None
+        candidate = self.requested_random_map_idx if requested_idx is None else requested_idx
+        available = sorted(self.bound_collection.keys())
+        if candidate is None:
+            return random.choice(available)
+        if isinstance(candidate, (list, tuple, set)):
+            candidate_values = [int(item) for item in candidate]
+        else:
+            candidate_values = [int(candidate)]
+        if not candidate_values:
+            raise ValueError("random_map_idx must contain at least one map index.")
+
+        resolved_candidates = []
+        for candidate_value in candidate_values:
+            if candidate_value < 0:
+                return random.choice(available)
+            if candidate_value not in self.bound_collection:
+                raise ValueError(
+                    "Requested random_map_idx {} is unavailable. Valid map indices: {}".format(
+                        candidate_value, available
+                    )
+                )
+            resolved_candidates.append(candidate_value)
+        return random.choice(resolved_candidates)
+
+    def _activate_precomputed_map(self, map_idx):
+        self.current_random_map_idx = map_idx
+        self.bound = list(self.bound_collection[map_idx])
+        self.world_map_2D = np.asarray(self.world_map_2D_collection[map_idx])
+        self.world_map_2D_jps = self.world_map_2D_jps_collection[map_idx]
+        self.world_map_2D_polyList = self.world_map_2D_polyList_collection[map_idx]
+        self.world_STRtree = self.world_STRtree_collection[map_idx]
+        self.all_buildingSTR = self.all_buildingSTR_collection[map_idx]
+        self.all_buildingSTR_wBound = self.all_buildingSTR_wBound_collection[map_idx]
+        self.all_building_centre = self.all_building_centre_collection[map_idx]
+        self.list_of_occupied_grid_wBound = self.list_of_occupied_grid_wBound_collection[map_idx]
+        self.target_pool = self.target_pool_collection[map_idx]
+        self.centroid_to_position_empty = self.centroid_to_position_empty_collection.get(map_idx, {})
+        self.centroid_to_position_occupied = self.centroid_to_position_occupied_collection.get(map_idx, {})
+        self.cropped_to_actual = self.cropped_coord_match_actual_coord.get(map_idx, {})
+        self.actual_to_cropped = {
+            tuple(float(coord) for coord in actual_coord): tuple(cropped_coord)
+            for cropped_coord, actual_coord in self.cropped_to_actual.items()
+        }
+        self.normalizer = NormalizeData(
+            [self.bound[0], self.bound[1]],
+            [self.bound[2], self.bound[3]],
+            self.max_speed,
+            [-self.acc_max, self.acc_max],
+        )
+
+    @staticmethod
+    def _load_texture_rgba(
+            texture_path,
+            alpha,
+            neutral_tolerance=0.10,
+            light_background_threshold=0.72,
+            dark_background_threshold=0.28,
+    ):
+        texture = mpimg.imread(texture_path)
+        if np.issubdtype(texture.dtype, np.integer):
+            texture = texture.astype(np.float32) / 255.0
+        else:
+            texture = texture.astype(np.float32)
+
+        if texture.ndim == 2:
+            texture = np.stack([texture, texture, texture], axis=-1)
+
+        if texture.shape[-1] == 4:
+            rgb = texture[..., :3]
+            source_alpha = texture[..., 3]
+        else:
+            rgb = texture[..., :3]
+            source_alpha = np.ones(rgb.shape[:2], dtype=np.float32)
+
+        brightness = rgb.mean(axis=-1)
+        chroma = rgb.max(axis=-1) - rgb.min(axis=-1)
+        candidate_background = (
+            ((brightness >= light_background_threshold) | (brightness <= dark_background_threshold))
+            & (chroma <= neutral_tolerance)
+        )
+
+        background_mask = np.zeros(candidate_background.shape, dtype=bool)
+        visited = np.zeros(candidate_background.shape, dtype=bool)
+        height, width = candidate_background.shape
+        stack = []
+
+        for x in range(width):
+            stack.append((0, x))
+            stack.append((height - 1, x))
+        for y in range(1, height - 1):
+            stack.append((y, 0))
+            stack.append((y, width - 1))
+
+        while stack:
+            y, x = stack.pop()
+            if visited[y, x]:
+                continue
+            visited[y, x] = True
+            if not candidate_background[y, x]:
+                continue
+
+            background_mask[y, x] = True
+            if y > 0:
+                stack.append((y - 1, x))
+            if y < height - 1:
+                stack.append((y + 1, x))
+            if x > 0:
+                stack.append((y, x - 1))
+            if x < width - 1:
+                stack.append((y, x + 1))
+
+        alpha_channel = source_alpha * (~background_mask).astype(np.float32) * alpha
+        return np.dstack((rgb, alpha_channel))
+
+    @staticmethod
+    def _crop_texture_to_foreground(texture_rgba, alpha_threshold=1e-3):
+        if texture_rgba is None:
+            return None
+
+        foreground = texture_rgba[..., 3] > alpha_threshold
+        if not np.any(foreground):
+            return texture_rgba
+
+        row_idx, col_idx = np.where(foreground)
+        min_row, max_row = row_idx.min(), row_idx.max()
+        min_col, max_col = col_idx.min(), col_idx.max()
+        return texture_rgba[min_row:max_row + 1, min_col:max_col + 1, :]
+
+    @staticmethod
+    def _read_texture_with_native_alpha(texture_path, alpha=1.0):
+        texture = mpimg.imread(texture_path)
+        if np.issubdtype(texture.dtype, np.integer):
+            texture = texture.astype(np.float32) / 255.0
+        else:
+            texture = texture.astype(np.float32)
+
+        if texture.ndim == 2:
+            texture = np.stack([texture, texture, texture], axis=-1)
+
+        if texture.shape[-1] == 4:
+            rgb = texture[..., :3]
+            source_alpha = texture[..., 3]
+        else:
+            rgb = texture[..., :3]
+            source_alpha = np.ones(rgb.shape[:2], dtype=np.float32)
+
+        return np.dstack((rgb, source_alpha * alpha))
+
+    def _get_occupied_poly_texture_rgba(self, alpha=0.18):
+        if self._occupied_poly_texture_rgba is not None:
+            return self._occupied_poly_texture_rgba
+
+        if self.occupied_poly_texture_path is None:
+            return None
+
+        texture_path = Path(self.occupied_poly_texture_path)
+        if not texture_path.exists():
+            return None
+
+        self._occupied_poly_texture_rgba = self._load_texture_rgba(texture_path, alpha=alpha)
+        return self._occupied_poly_texture_rgba
+
+    def _draw_occupied_poly_texture(self, ax, alpha=0.5):
+        texture_rgba = self._get_occupied_poly_texture_rgba(alpha=alpha)
+        if texture_rgba is None:
+            return False
+
+        for one_poly in self.world_map_2D_polyList[0][0]:
+            min_x, min_y, max_x, max_y = one_poly.bounds
+            clip_patch = shapelypoly_to_matpoly(one_poly, True, 'none')
+            clip_patch.set_transform(ax.transData)
+            ax.imshow(
+                texture_rgba,
+                extent=(min_x, max_x, min_y, max_y),
+                interpolation='bilinear',
+                clip_path=clip_patch,
+                clip_on=True,
+                zorder=0.8,
+            )
+
+            one_poly_patch = shapelypoly_to_matpoly(one_poly, False, '#d8cf6a')
+            one_poly_patch.set_facecolor('none')
+            one_poly_patch.set_linewidth(0.3)
+            one_poly_patch.set_alpha(0.4)
+            ax.add_patch(one_poly_patch)
+        return True
+
+    def _get_destination_marker_texture_rgba(self, alpha=0.95):
+        if self._destination_marker_texture_rgba is not None:
+            return self._destination_marker_texture_rgba
+
+        if self.destination_marker_texture_path is None:
+            return None
+
+        texture_path = Path(self.destination_marker_texture_path)
+        if not texture_path.exists():
+            return None
+
+        self._destination_marker_texture_rgba = self._load_texture_rgba(texture_path, alpha=alpha)
+        return self._destination_marker_texture_rgba
+
+    def _get_start_marker_texture_rgba(self, alpha=0.95):
+        if self._start_marker_texture_rgba is not None:
+            return self._start_marker_texture_rgba
+
+        if self.start_marker_texture_path is None:
+            return None
+
+        texture_path = Path(self.start_marker_texture_path)
+        if not texture_path.exists():
+            return None
+
+        self._start_marker_texture_rgba = self._crop_texture_to_foreground(
+            self._read_texture_with_native_alpha(texture_path, alpha=alpha)
+        )
+        return self._start_marker_texture_rgba
+
+    def _draw_start_marker(self, ax, start_pos, marker_radius=5):
+        if start_pos is None:
+            return
+
+        texture_rgba = self._get_start_marker_texture_rgba()
+        if texture_rgba is None:
+            return
+
+        start_x, start_y = start_pos[0], start_pos[1]
+        image_radius = marker_radius
+        clip_circle = Circle((start_x, start_y), radius=image_radius, transform=ax.transData)
+        ax.imshow(
+            texture_rgba,
+            extent=(start_x - image_radius, start_x + image_radius, start_y - image_radius, start_y + image_radius),
+            interpolation='bilinear',
+            clip_path=clip_circle,
+            clip_on=True,
+            zorder=3.0,
+        )
+
+    def _draw_destination_marker(self, ax, goal_pos, agent_idx, marker_radius=None):
+        if goal_pos is None:
+            return
+
+        texture_rgba = self._get_destination_marker_texture_rgba()
+        goal_x, goal_y = goal_pos[0], goal_pos[1]
+        radius = 5 if marker_radius is None else marker_radius
+        # image_radius = radius * 0.8
+        image_radius = radius
+
+        background_circle = Circle(
+            (goal_x, goal_y),
+            radius=radius,
+            facecolor='white',
+            edgecolor='none',
+            zorder=3.0,
+        )
+        # ax.add_patch(background_circle)
+
+        if texture_rgba is not None:
+            clip_circle = Circle((goal_x, goal_y), radius=image_radius, transform=ax.transData)
+            ax.imshow(
+                texture_rgba,
+                extent=(goal_x - image_radius, goal_x + image_radius, goal_y - image_radius, goal_y + image_radius),
+                interpolation='bilinear',
+                clip_path=clip_circle,
+                clip_on=True,
+                zorder=3.1,
+            )
+
+        border_circle = Circle(
+            (goal_x, goal_y),
+            radius=radius,
+            fill=False,
+            edgecolor='#111111',
+            linewidth=2.0,
+            zorder=3.2,
+        )
+        # ax.add_patch(border_circle)
+
+        label = ax.text(
+            goal_x,
+            goal_y+3,
+            str(agent_idx),
+            ha='center',
+            va='center',
+            color='white',
+            fontsize=6,
+            fontweight='bold',
+            zorder=3.3,
+        )
+        label.set_path_effects([patheffects.withStroke(linewidth=2.2, foreground='black')])
 
     def _load_legacy_backend(self, legacy_code_dir: str):
         legacy_path = Path(legacy_code_dir)
@@ -280,6 +702,61 @@ class SharedMultiAgentEnv:
             self.initial_noise_sigma,
         )
         self.all_uavs = {}
+        for uav_idx in range(self.n_agents):
+            uav = UAV(self.action_dim, uav_idx, self.gamma, self.tau, self.n_agents, self.max_speed)
+            uav.target_update_step = self.update_every
+            self.all_uavs[uav_idx] = uav
+        self.dummy_uav = self.all_uavs[0]
+
+        if self._using_precomputed_maps:
+            for map_idx, poly_groups in self.world_map_2D_polyList_collection.items():
+                occupied_polygons = poly_groups[0][0]
+                non_occupied_polygon = poly_groups[0][1]
+                bound = self.bound_collection[map_idx]
+                world_map = np.asarray(self.world_map_2D_collection[map_idx])
+
+                self.world_map_2D_jps_collection[map_idx] = world_map.astype(int).tolist()
+                self.all_buildingSTR_collection[map_idx] = STRtree(occupied_polygons)
+                building_centroid = [poly.centroid.coords[0] for poly in occupied_polygons]
+                if building_centroid:
+                    self.all_building_centre_collection[map_idx] = np.asarray(building_centroid, dtype=np.float64)
+                else:
+                    self.all_building_centre_collection[map_idx] = np.empty((0, 2), dtype=np.float64)
+
+                world_grid_poly_combine = occupied_polygons + non_occupied_polygon
+                self.world_STRtree_collection[map_idx] = STRtree(world_grid_poly_combine)
+
+                self.centroid_to_position_empty_collection[map_idx] = {
+                    tuple(float(coord) for coord in actual_coord): [float(cropped_coord[0]), float(cropped_coord[1])]
+                    for cropped_coord, actual_coord in self.cropped_coord_match_actual_coord.get(map_idx, {}).items()
+                }
+
+                occupied_lookup = {}
+                for x_idx in range(world_map.shape[0]):
+                    for y_idx in range(world_map.shape[1]):
+                        if int(world_map[x_idx][y_idx]) != 1:
+                            continue
+                        actual_coord = (
+                            float(bound[0] + x_idx * self.grid_length),
+                            float(bound[2] + y_idx * self.grid_length),
+                        )
+                        occupied_lookup[actual_coord] = [float(x_idx), float(y_idx)]
+                self.centroid_to_position_occupied_collection[map_idx] = occupied_lookup
+
+                x_left_bound = LineString([(bound[0], -9999), (bound[0], 9999)])
+                x_right_bound = LineString([(bound[1], -9999), (bound[1], 9999)])
+                y_bottom_bound = LineString([(-9999, bound[2]), (9999, bound[2])])
+                y_top_bound = LineString([(-9999, bound[3]), (9999, bound[3])])
+                boundary_lines = [x_left_bound, x_right_bound, y_bottom_bound, y_top_bound]
+                list_occupied_grids = copy.deepcopy(occupied_polygons)
+                list_occupied_grids.extend(boundary_lines)
+                self.all_buildingSTR_wBound_collection[map_idx] = STRtree(list_occupied_grids)
+                self.list_of_occupied_grid_wBound_collection[map_idx] = list_occupied_grids
+                self.target_pool_collection[map_idx] = self._build_target_pool_for_map(bound, non_occupied_polygon)
+
+            self._activate_precomputed_map(self._resolve_map_index())
+            return
+
         self.all_buildingSTR = STRtree(self.world_map_2D_polyList[0][0])
         building_centroid = [poly.centroid.coords[0] for poly in self.world_map_2D_polyList[0][0]]
         self.all_building_centre = np.array(building_centroid)
@@ -288,11 +765,6 @@ class SharedMultiAgentEnv:
             self.world_map_2D_polyList[0][0] + self.world_map_2D_polyList[0][1]
         ]
         self.world_STRtree = STRtree(worldGrid_polyCombine[0])
-        for uav_idx in range(self.n_agents):
-            uav = UAV(self.action_dim, uav_idx, self.gamma, self.tau, self.n_agents, self.max_speed)
-            uav.target_update_step = self.update_every
-            self.all_uavs[uav_idx] = uav
-        self.dummy_uav = self.all_uavs[0]
 
         # adjustment to world_map_2D
         # draw world_map_scatter
@@ -453,6 +925,8 @@ class SharedMultiAgentEnv:
 
         # reset OU_noise as well
         self.OU_noise.reset()
+        if self._using_precomputed_maps:
+            self._activate_precomputed_map(self._resolve_map_index())
 
         agentsCoor_list = []  # for store all agents as circle polygon
         agentRefer_dict = {}  # A dictionary to use agent's current pos as key, their agent name (idx) as value
@@ -566,22 +1040,33 @@ class SharedMultiAgentEnv:
                     curHeading = nextHeading  # update the current heading
             refinedPath.append(outPath[-1])
 
+            if self._using_precomputed_maps:
+                goal_points = [
+                    [
+                        float(self.cropped_to_actual[(int(points[0]), int(points[1]))][0]),
+                        float(self.cropped_to_actual[(int(points[0]), int(points[1]))][1]),
+                    ]
+                    for points in refinedPath
+                ]
+            else:
+                goal_points = [
+                    [
+                        (points[0] + math.ceil(self.bound[0] / self.grid_length)) * self.grid_length,
+                        (points[1] + math.ceil(self.bound[2] / self.grid_length)) * self.grid_length,
+                    ]
+                    for points in refinedPath
+                ]
+
             # load the to goal, but remove/exclude the 1st point, which is the initial position
             self.all_uavs[agentIdx].goal = [
-                [(points[0] + math.ceil(self.bound[0] / self.grid_length)) * self.grid_length,
-                 (points[1] + math.ceil(self.bound[2] / self.grid_length)) * self.grid_length]
-                for points in refinedPath if not np.array_equal(
-                    np.array([(points[0] + math.ceil(self.bound[0] / self.grid_length)) * self.grid_length,
-                              (points[1] + math.ceil(self.bound[2] / self.grid_length)) * self.grid_length]),
-                    self.all_uavs[
-                        agentIdx].ini_pos)]  # if not np.array_equal(np.array(points), self.all_agents[agentIdx].ini_pos)
+                point for point in goal_points
+                if not np.array_equal(np.array(point), self.all_uavs[agentIdx].ini_pos)
+            ]  # if not np.array_equal(np.array(points), self.all_agents[agentIdx].ini_pos)
 
             self.all_uavs[agentIdx].waypoints = deepcopy(self.all_uavs[agentIdx].goal)
 
             # load the to goal but we include the initial position
-            goalPt_withini = [[(points[0] + math.ceil(self.bound[0] / self.grid_length)) * self.grid_length,
-                               (points[1] + math.ceil(self.bound[2] / self.grid_length)) * self.grid_length]
-                              for points in refinedPath]
+            goalPt_withini = goal_points
 
             self.all_uavs[agentIdx].ref_line = LineString(goalPt_withini)
             # ---------------- end of using random initialized agent position for traffic flow ---------
@@ -642,10 +1127,26 @@ class SharedMultiAgentEnv:
             matplotlib.use('TkAgg')
             fig, ax = plt.subplots(1, 1)
             for agentIdx, agent in self.all_uavs.items():
-                plt.plot(agent.pos[0], agent.pos[1], marker=MarkerStyle(">", fillstyle="right",
-                                                                        transform=Affine2D().rotate_deg(
-                                                                            math.degrees(agent.heading))), color='y')
-                plt.text(agent.pos[0], agent.pos[1], agent.agent_name)
+                self._draw_start_marker(ax, agent.pos)
+                # plt.plot(agent.pos[0], agent.pos[1], marker=MarkerStyle(">", fillstyle="right",
+                #                                                         transform=Affine2D().rotate_deg(
+                #                                                             math.degrees(agent.heading))),
+                #          color=(1.0, 0.84, 0.0, 0.55), markersize=8, zorder=3.4)
+                # plt.text(agent.pos[0], agent.pos[1], agent.agent_name)
+                start_label = plt.text(
+                    agent.pos[0],
+                    agent.pos[1] - 3,
+                    str(agentIdx),
+                    ha='center',
+                    va='center',
+                    color='#4dd0e1',
+                    fontsize=6,
+                    fontweight='bold',
+                    zorder=3.3,
+                )
+                start_label.set_path_effects([patheffects.withStroke(linewidth=1.8, foreground='black')])
+                # plt.text(agent.pos[0], agent.pos[1]+3, agentIdx)
+
                 # plot self_circle of the drone
                 self_circle = Point(agent.pos[0], agent.pos[1]).buffer(agent.protectiveBound, cap_style='round')
                 grid_mat_Scir = shapelypoly_to_matpoly(self_circle, False, 'k')
@@ -655,29 +1156,42 @@ class SharedMultiAgentEnv:
                 detec_circle = Point(agent.pos[0], agent.pos[1]).buffer(agent.detectionRange / 2, cap_style='round')
                 detec_circle_mat = shapelypoly_to_matpoly(detec_circle, False, 'r')
                 # ax.add_patch(detec_circle_mat)
+                self._draw_destination_marker(ax, agent.goal[-1], agentIdx)
 
-                # link individual drone's starting position with its goal
-                ini = agent.ini_pos
-                for wp in agent.goal:
-                    plt.plot(wp[0], wp[1], marker='*', color='y', markersize=10)
-                    plt.plot([wp[0], ini[0]], [wp[1], ini[1]], '--', color='c')
-                    ini = wp
-                plt.plot(agent.goal[-1][0], agent.goal[-1][1], marker='*', color='y', markersize=10)
-                plt.text(agent.goal[-1][0], agent.goal[-1][1], agent.agent_name)
+                # # link individual drone's starting position with its goal
+                # ini = agent.ini_pos
+                # for wp in agent.goal:
+                #     plt.plot(wp[0], wp[1], marker='*', color='y', markersize=10)
+                #     plt.plot([wp[0], ini[0]], [wp[1], ini[1]], '--', color='c')
+                #     ini = wp
+                # plt.plot(agent.goal[-1][0], agent.goal[-1][1], marker='*', color='y', markersize=10)
+                # plt.text(agent.goal[-1][0], agent.goal[-1][1], agent.agent_name)
 
             # draw occupied_poly
-            for one_poly in self.world_map_2D_polyList[0][0]:
-                one_poly_mat = shapelypoly_to_matpoly(one_poly, True, 'y')
-                # ax.add_patch(one_poly_mat)
+            occupied_texture_drawn = self._draw_occupied_poly_texture(ax)
+            if not occupied_texture_drawn:
+                for one_poly in self.world_map_2D_polyList[0][0]:
+                    one_poly_mat = shapelypoly_to_matpoly(one_poly, True, 'y')
+                    one_poly_mat.set_facecolor('#fff7b3')
+                    one_poly_mat.set_alpha(0.5)
+                    one_poly_mat.set_linewidth(0.5)
+                    ax.add_patch(one_poly_mat)
+
             # draw non-occupied_poly
             for zero_poly in self.world_map_2D_polyList[0][1]:
                 zero_poly_mat = shapelypoly_to_matpoly(zero_poly, False, 'y')
-                ax.add_patch(zero_poly_mat)
+                zero_poly_mat.set_edgecolor('#f3e98a')
+                zero_poly_mat.set_alpha(0.8)
+                zero_poly_mat.set_linewidth(0.8)
+                # ax.add_patch(zero_poly_mat)
 
             # show building obstacles
             for poly in self.buildingPolygons:
                 matp_poly = shapelypoly_to_matpoly(poly, False, 'red')  # the 3rd parameter is the edge color
-                # ax.add_patch(matp_poly)
+                matp_poly.set_facecolor('#c62828')
+                matp_poly.set_alpha(0.6)
+                matp_poly.set_linewidth(1.0)
+                ax.add_patch(matp_poly)
 
             # show the nearest building obstacles
             # nearest_buildingPoly_mat = shapelypoly_to_matpoly(nearest_buildingPoly, True, 'g', 'k')
@@ -729,14 +1243,16 @@ class SharedMultiAgentEnv:
             # for ele4 in self.spawn_area4_polymat:
             #     ax.add_patch(ele4)
 
-            # plt.axvline(x=self.bound[0], c="green")
-            # plt.axvline(x=self.bound[1], c="green")
-            # plt.axhline(y=self.bound[2], c="green")
-            # plt.axhline(y=self.bound[3], c="green")
+            ax.set_xlim(self.bound[0], self.bound[1])
+            ax.set_ylim(self.bound[2], self.bound[3])
 
-            plt.xlabel("X axis")
-            plt.ylabel("Y axis")
-            plt.axis('equal')
+            plt.xlabel(" ")
+            plt.ylabel(" ")
+            # ax.set_axis_off()
+            # plt.axis('equal')
+            ax.set_yticklabels([])
+            ax.set_xticklabels([])
+            ax.tick_params(axis='both', which='both', bottom=False, top=False, left=False, right=False, labelbottom=False,)
             plt.show()
 
         return overall_state, norm_overall_state

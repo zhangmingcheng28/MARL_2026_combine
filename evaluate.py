@@ -132,23 +132,29 @@ def main(config):
                 )
             elif all(check_goal) and all(agent_reach_target):
                 episode_decision[2] = True
-                static_png_path = os.path.join(
+                sprite_gif_path = os.path.join(
                     config["paths"]["project_root"],
                     "resources",
-                    "static_traj_episode_{}.png".format(episode),
+                    "eval_sprite_episode_{}.gif".format(episode),
                 )
-                view_static_traj_DWTD(
+                sprite_image_path = (
+                    getattr(env, "gif_sprite_texture_path", None)
+                    or getattr(env, "occupied_poly_texture_path", None)
+                    or getattr(env, "destination_marker_texture_path", None)
+                    or getattr(env, "start_marker_texture_path", None)
+                )
+                save_sprite_gif(
                     env=env,
                     trajectory_eachPlay=trajectory_eachPlay,
-                    random_map_idx=0,
-                    save_path=static_png_path,
-                    max_time_step=len(trajectory_eachPlay),
+                    output_path=sprite_gif_path,
+                    sprite_image_path=sprite_image_path,
                 )
                 print(
                     "All agents have reached their destinations at step {}, episode {} terminated.".format(
                         step - 1, episode
                     )
                 )
+                print("Saved evaluation GIF to {}".format(sprite_gif_path))
 
             if True in episode_decision:
                 for agent_idx, agent in env.all_uavs.items():

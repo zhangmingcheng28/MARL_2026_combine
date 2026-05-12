@@ -8,25 +8,26 @@ DEFAULT_CONFIG = {
     "seed": 777,
     "device": "auto",
     "dtype": "float32",
-    "mode": "train",  # or evaluate
-    "algorithm": "maddpg",  # or maddpg or matd3 or iddpg
+    "mode": "eval",  # or evaluate
+    "algorithm": "iddpg",  # or maddpg, maddpg-critic-attention, matd3, matd3-critic-attention, iddpg, fm-iddpg
     "exp_name": "default_exp",
-    "save_interval": 1000,
+    "save_interval": 5000,
     "paths": {
         "project_root": str(PROJECT_ROOT),
         "resource_env_var": DEFAULT_RESOURCE_ENV_VAR,
         "checkpoint_dir": "checkpoints",
-        # "checkpoint_run": "060426_06_30_57",  # this is for evaluation
-        "checkpoint_run": None,  # this is actually also used for training folder saving, training just use None
-        "checkpoint_kind": "ep",
-        "checkpoint_value": 10000,
+        "checkpoint_run": "110526_03_22_04",  # this is for evaluation
+        # "checkpoint_run": None,  # this is also used for training folder saving; training uses None
+        "checkpoint_kind": "step",
+        "checkpoint_value": 450000,
         "resource_file": None,
         "shape_file": "resources/lakesideMap/lakeSide.shp",
         "agent_config_file": "resources/fixedDrone_3drones.xlsx",
+        "map_bundle_dir": "resources/precomputed_maps",
         "legacy_code_dir": None,
     },
     "env": {
-        "n_agents": 8,
+        "n_agents": 12,
         "action_dim": 2,
         "max_steps": 100,
         "nearest_neighbor_count": 3,
@@ -37,15 +38,16 @@ DEFAULT_CONFIG = {
         "grid_length": 10,
         "acc_max": 8,
         "max_speed": 5,
+        "random_map_idx": [3],
         "neighbour_search_distance": 100000,
         "full_observable_critic": False,
         "evaluation_by_episode": False,
     },
     "train": {
         "num_episodes": 20000,
-        "total_steps": 2000000,
+        "total_steps": 450000,
         "num_parallel_envs": 1,
-        "stop_mode": "episode",  # or "step"
+        "stop_mode": "step",  # or "step" or "episode"
         "batch_size": 12,
         "buffer_size": int(1e5),
         "actor_lr": 0.0001,
@@ -54,11 +56,17 @@ DEFAULT_CONFIG = {
         "tau": 0.01,
         "hidden_dim": 128,
         "update_every": 1,
+        "learning_starts": 1000,
+        "max_grad_norm": 0.0,
+        "feature_matching_lambda": 0.002,
+        "policy_noise": 0,
+        "noise_clip": 0,
+        "policy_delay": 1,
     },
     "exploration": {
         "eps_start": 1.0,
         "eps_end": 0.03,
-        "eps_period": 10000,  # the noise finishes decaying and reaches eps_end.”
+        "eps_period": 225000,  # noise decay horizon before reaching eps_end
         "largest_noise_sigma": 0.5,
         "smallest_noise_sigma": 0.15,
         "initial_noise_sigma": 0.5,
@@ -73,9 +81,9 @@ DEFAULT_CONFIG = {
         "use_gru": False,
         "use_single_portion_selfatt": False,
         "use_selfatt_with_radar": False,
-        "use_all_neigh_with_radar": True,  # for iddpg only, keep it, other wise training will fail
+        "use_all_neigh_with_radar": True,  # for iddpg only, keep it, otherwise training will fail
+        "use_critic_attention": False,
         "own_obs_only": False,
-
     },
     "eval": {
         "episodes": 100,
@@ -85,6 +93,18 @@ DEFAULT_CONFIG = {
 
 def _parse_int_list(raw_value):
     return [int(item.strip()) for item in raw_value.split(",") if item.strip()]
+
+
+def _parse_random_map_idx(raw_value):
+    if isinstance(raw_value, (list, tuple)):
+        values = [int(item) for item in raw_value]
+    elif isinstance(raw_value, str):
+        values = [int(item.strip()) for item in raw_value.split(",") if item.strip()]
+    else:
+        values = [int(raw_value)]
+    if not values:
+        raise argparse.ArgumentTypeError("random_map_idx must contain at least one map index.")
+    return values
 
 
 def _resolve_optional_path(raw_path):
@@ -103,7 +123,12 @@ def get_args():
     parser = argparse.ArgumentParser()
 
     parser.add_argument("--mode", type=str, default=DEFAULT_CONFIG["mode"], choices=["train", "evaluate"])
-    parser.add_argument("--algo", type=str, default=DEFAULT_CONFIG["algorithm"], choices=["iddpg", "maddpg", "matd3"])
+    parser.add_argument(
+        "--algo",
+        type=str,
+        default=DEFAULT_CONFIG["algorithm"],
+        choices=["iddpg", "fm-iddpg", "maddpg", "maddpg-critic-attention", "matd3", "matd3-critic-attention"],
+    )
     parser.add_argument("--exp_name", type=str, default=DEFAULT_CONFIG["exp_name"])
 
     parser.add_argument("--n_agents", type=int, default=DEFAULT_CONFIG["env"]["n_agents"])
@@ -116,6 +141,11 @@ def get_args():
     parser.add_argument("--grid_length", type=int, default=DEFAULT_CONFIG["env"]["grid_length"])
     parser.add_argument("--grid_obs_shape", type=_parse_int_list, default=list(DEFAULT_CONFIG["env"]["grid_obs_shape"]))
     parser.add_argument("--bound", type=_parse_int_list, default=list(DEFAULT_CONFIG["env"]["bound"]))
+    parser.add_argument(
+        "--random_map_idx",
+        type=_parse_random_map_idx,
+        default=list(DEFAULT_CONFIG["env"]["random_map_idx"]),
+    )
     parser.add_argument("--acc_max", type=float, default=DEFAULT_CONFIG["env"]["acc_max"])
     parser.add_argument("--max_speed", type=float, default=DEFAULT_CONFIG["env"]["max_speed"])
 
@@ -137,6 +167,16 @@ def get_args():
     parser.add_argument("--buffer_size", type=int, default=DEFAULT_CONFIG["train"]["buffer_size"])
     parser.add_argument("--batch_size", type=int, default=DEFAULT_CONFIG["train"]["batch_size"])
     parser.add_argument("--update_every", type=int, default=DEFAULT_CONFIG["train"]["update_every"])
+    parser.add_argument("--learning_starts", type=int, default=DEFAULT_CONFIG["train"]["learning_starts"])
+    parser.add_argument("--max_grad_norm", type=float, default=DEFAULT_CONFIG["train"]["max_grad_norm"])
+    parser.add_argument(
+        "--feature_matching_lambda",
+        type=float,
+        default=DEFAULT_CONFIG["train"]["feature_matching_lambda"],
+    )
+    parser.add_argument("--policy_noise", type=float, default=DEFAULT_CONFIG["train"]["policy_noise"])
+    parser.add_argument("--noise_clip", type=float, default=DEFAULT_CONFIG["train"]["noise_clip"])
+    parser.add_argument("--policy_delay", type=int, default=DEFAULT_CONFIG["train"]["policy_delay"])
 
     parser.add_argument("--eps_start", type=float, default=DEFAULT_CONFIG["exploration"]["eps_start"])
     parser.add_argument("--eps_end", type=float, default=DEFAULT_CONFIG["exploration"]["eps_end"])
@@ -155,6 +195,7 @@ def get_args():
     parser.add_argument("--use_single_portion_selfatt", action="store_true", default=DEFAULT_CONFIG["flags"]["use_single_portion_selfatt"])
     parser.add_argument("--use_selfatt_with_radar", action="store_true", default=DEFAULT_CONFIG["flags"]["use_selfatt_with_radar"])
     parser.add_argument("--use_all_neigh_with_radar", action="store_true", default=DEFAULT_CONFIG["flags"]["use_all_neigh_with_radar"])
+    parser.add_argument("--use_critic_attention", action="store_true", default=DEFAULT_CONFIG["flags"]["use_critic_attention"])
     parser.add_argument("--own_obs_only", action="store_true", default=DEFAULT_CONFIG["flags"]["own_obs_only"])
 
     parser.add_argument("--device", type=str, default=DEFAULT_CONFIG["device"])
@@ -169,6 +210,7 @@ def get_args():
     parser.add_argument("--resource_file", type=str, default=DEFAULT_CONFIG["paths"]["resource_file"])
     parser.add_argument("--shape_file", type=str, default=DEFAULT_CONFIG["paths"]["shape_file"])
     parser.add_argument("--agent_config_file", type=str, default=DEFAULT_CONFIG["paths"]["agent_config_file"])
+    parser.add_argument("--map_bundle_dir", type=str, default=DEFAULT_CONFIG["paths"]["map_bundle_dir"])
     parser.add_argument("--legacy_code_dir", type=str, default=DEFAULT_CONFIG["paths"]["legacy_code_dir"])
 
     return parser.parse_args()
@@ -185,17 +227,20 @@ def build_config(args):
     config["dtype"] = args.dtype
     config["save_interval"] = args.save_interval
 
+    checkpoint_run = None if args.mode == "train" else args.checkpoint_run
+
     checkpoint_dir = args.checkpoint_dir
-    if args.checkpoint_run not in (None, ""):
-        checkpoint_dir = "{}/{}/{}".format(args.checkpoint_dir.rstrip("/\\"), args.exp_name, args.checkpoint_run)
+    if checkpoint_run not in (None, ""):
+        checkpoint_dir = "{}/{}/{}".format(args.checkpoint_dir.rstrip("/\\"), args.exp_name, checkpoint_run)
 
     config["paths"]["checkpoint_dir"] = resolve_path(checkpoint_dir)
-    config["paths"]["checkpoint_run"] = args.checkpoint_run
+    config["paths"]["checkpoint_run"] = checkpoint_run
     config["paths"]["checkpoint_kind"] = args.checkpoint_kind
     config["paths"]["checkpoint_value"] = args.checkpoint_value
     config["paths"]["resource_file"] = _resolve_optional_path(args.resource_file)
     config["paths"]["shape_file"] = resolve_path(args.shape_file)
     config["paths"]["agent_config_file"] = resolve_path(args.agent_config_file)
+    config["paths"]["map_bundle_dir"] = _resolve_optional_path(args.map_bundle_dir)
     config["paths"]["legacy_code_dir"] = _resolve_optional_path(args.legacy_code_dir)
 
     config["env"]["n_agents"] = args.n_agents
@@ -204,6 +249,7 @@ def build_config(args):
     config["env"]["nearest_neighbor_count"] = max(0, int(args.nearest_neighbor_count))
     config["env"]["grid_obs_shape"] = list(args.grid_obs_shape)
     config["env"]["bound"] = list(args.bound)
+    config["env"]["random_map_idx"] = _parse_random_map_idx(args.random_map_idx)
     config["env"]["acc_max"] = args.acc_max
     config["env"]["max_speed"] = args.max_speed
     config["env"]["resource_file"] = config["paths"]["resource_file"]
@@ -220,6 +266,12 @@ def build_config(args):
     config["train"]["tau"] = args.tau
     config["train"]["hidden_dim"] = args.hidden_dim
     config["train"]["update_every"] = args.update_every
+    config["train"]["learning_starts"] = args.learning_starts
+    config["train"]["max_grad_norm"] = args.max_grad_norm
+    config["train"]["feature_matching_lambda"] = args.feature_matching_lambda
+    config["train"]["policy_noise"] = args.policy_noise
+    config["train"]["noise_clip"] = args.noise_clip
+    config["train"]["policy_delay"] = args.policy_delay
 
     config["exploration"]["eps_start"] = args.eps_start
     config["exploration"]["eps_end"] = args.eps_end
@@ -238,6 +290,10 @@ def build_config(args):
     config["flags"]["use_single_portion_selfatt"] = args.use_single_portion_selfatt
     config["flags"]["use_selfatt_with_radar"] = args.use_selfatt_with_radar
     config["flags"]["use_all_neigh_with_radar"] = args.use_all_neigh_with_radar
+    config["flags"]["use_critic_attention"] = args.use_critic_attention or args.algo in (
+        "maddpg-critic-attention",
+        "matd3-critic-attention",
+    )
     config["flags"]["own_obs_only"] = args.own_obs_only
 
     config["env"]["full_observable_critic"] = config["flags"]["full_observable_critic"]
@@ -245,11 +301,7 @@ def build_config(args):
 
     config["eval"]["episodes"] = args.eval_episodes
 
-    if args.algo == "matd3":
-        if args.obs_dim is None:
-            raise ValueError("--obs_dim is required when --algo is 'matd3'.")
-        config["env"]["obs_dim"] = args.obs_dim
-    elif args.algo == "maddpg":
+    if args.algo in ("maddpg", "maddpg-critic-attention", "matd3", "matd3-critic-attention"):
         config["env"].pop("obs_dim", None)
     else:
         config["env"].pop("obs_dim", None)

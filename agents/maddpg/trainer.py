@@ -8,7 +8,7 @@ from copy import deepcopy
 from agents.base_trainer import BaseTrainer
 from agents.common.buffer import ReplayBuffer
 from agents.common.utils import soft_update
-from agents.maddpg.networks import Actor, EmbeddedCentralCritic
+from agents.maddpg.networks import Actor, AttentionCentralCritic, EmbeddedCentralCritic
 
 
 class MADDPGTrainer(BaseTrainer):
@@ -27,6 +27,11 @@ class MADDPGTrainer(BaseTrainer):
         self.batch_size = config["train"]["batch_size"]
         self.update_every = config["train"]["update_every"]
         self.exploration = config.get("exploration", {})
+        self.flags = config.get("flags", {})
+        self.use_critic_attention = (
+            self.flags.get("use_critic_attention", False)
+            or config.get("algorithm", "").lower() == "maddpg-critic-attention"
+        )
 
         self.obs_dim = None
         self.obs_split_dims = None
@@ -115,7 +120,8 @@ class MADDPGTrainer(BaseTrainer):
             dtype=self.torch_dtype,
         )
         self.target_actor = deepcopy(self.actor).to(device=self.device, dtype=self.torch_dtype)
-        self.critic = EmbeddedCentralCritic(self.obs_split_dims, self.n_agents, self.action_dim, self.hidden_dim).to(
+        critic_cls = AttentionCentralCritic if self.use_critic_attention else EmbeddedCentralCritic
+        self.critic = critic_cls(self.obs_split_dims, self.n_agents, self.action_dim, self.hidden_dim).to(
             device=self.device,
             dtype=self.torch_dtype,
         )
@@ -258,9 +264,16 @@ class MADDPGTrainer(BaseTrainer):
         avg_actor_loss = torch.stack(actor_losses).mean()
         return [avg_critic_loss], [avg_actor_loss], single_eps_critic_cal_record
 
-    def save(self, path, episode=None, step=None):
+    def save(self, path, episode=None, step=None, stop_mode=None):
         if self.actor is None or self.critic is None:
             return
+        if stop_mode == "step":
+            episode = None
+        elif stop_mode == "episode":
+            step = None
+        elif stop_mode is not None:
+            raise ValueError("Unsupported stop_mode: {}. Expected 'step' or 'episode'.".format(stop_mode))
+
         os.makedirs(path, exist_ok=True)
         actor_path = os.path.join(path, "maddpg_actor.pt")
         critic_path = os.path.join(path, "maddpg_critic.pt")
