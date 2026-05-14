@@ -1,5 +1,6 @@
 import numpy as np
 import os
+import pickle
 from envs.shared_env import SharedMultiAgentEnv
 from agents import build_trainer
 from utils.plotting_helper import *
@@ -11,6 +12,12 @@ def _build_checkpoint_tag(paths_config):
     if checkpoint_kind in (None, "") or checkpoint_value in (None, ""):
         return None
     return "{}{}".format(checkpoint_kind, int(checkpoint_value))
+
+
+def _select_actions(trainer, env, norm_cur_state, evaluate):
+    if hasattr(trainer, "select_action_from_env"):
+        return trainer.select_action_from_env(env, evaluate=evaluate)
+    return trainer.select_action(norm_cur_state, evaluate=evaluate)
 
 
 def main(config):
@@ -50,7 +57,7 @@ def main(config):
     for episode in range(1, eval_episodes + 1):
         if hasattr(trainer, "begin_episode"):
             trainer.begin_episode(episode)
-        cur_state, norm_cur_state = env.reset(show=0)
+        cur_state, norm_cur_state = env.reset(episode, show=0)
         accum_reward = 0
         step = 0
         episode_decision = [False] * 3
@@ -62,7 +69,7 @@ def main(config):
         episode_goal_found = [False] * total_agent_num
 
         while True:
-            actions = trainer.select_action(norm_cur_state, evaluate=True)
+            actions = _select_actions(trainer, env, norm_cur_state, evaluate=True)
             norm_next_state, next_state, reward_aft_action, done_aft_action, info = env.step(actions)
 
             step += 1
@@ -132,29 +139,29 @@ def main(config):
                 )
             elif all(check_goal) and all(agent_reach_target):
                 episode_decision[2] = True
-                sprite_gif_path = os.path.join(
-                    config["paths"]["project_root"],
-                    "resources",
-                    "eval_sprite_episode_{}.gif".format(episode),
-                )
-                sprite_image_path = (
-                    getattr(env, "gif_sprite_texture_path", None)
-                    or getattr(env, "occupied_poly_texture_path", None)
-                    or getattr(env, "destination_marker_texture_path", None)
-                    or getattr(env, "start_marker_texture_path", None)
-                )
-                save_sprite_gif(
-                    env=env,
-                    trajectory_eachPlay=trajectory_eachPlay,
-                    output_path=sprite_gif_path,
-                    sprite_image_path=sprite_image_path,
-                )
+                # sprite_gif_path = os.path.join(
+                #     config["paths"]["project_root"],
+                #     "resources",
+                #     "eval_sprite_episode_{}.gif".format(episode),
+                # )
+                # sprite_image_path = (
+                #     getattr(env, "gif_sprite_texture_path", None)
+                #     or getattr(env, "occupied_poly_texture_path", None)
+                #     or getattr(env, "destination_marker_texture_path", None)
+                #     or getattr(env, "start_marker_texture_path", None)
+                # )
+                # save_sprite_gif(
+                #     env=env,
+                #     trajectory_eachPlay=trajectory_eachPlay,
+                #     output_path=sprite_gif_path,
+                #     sprite_image_path=sprite_image_path,
+                # )
                 print(
                     "All agents have reached their destinations at step {}, episode {} terminated.".format(
                         step - 1, episode
                     )
                 )
-                print("Saved evaluation GIF to {}".format(sprite_gif_path))
+                # print("Saved evaluation GIF to {}".format(sprite_gif_path))
 
             if True in episode_decision:
                 for agent_idx, agent in env.all_uavs.items():
@@ -198,6 +205,14 @@ def main(config):
         evaluation_OD_repeatability.append([eps_all_ac_OD_goal, trajectory_eachPlay])
         print("saving")
 
+    include_building_in_overall_conflict = flags.get("include_building_in_overall_conflict", False)
+    pickle_name = "repeat_OD_for_orca_uav_{}".format(total_agent_num)
+    if not include_building_in_overall_conflict:
+        pickle_name = "{}_nobuilding".format(pickle_name)
+    pickle_name = "{}_rev1.pickle".format(pickle_name)
+
+    with open(pickle_name, 'wb') as handle:
+        pickle.dump(evaluation_OD_repeatability, handle, protocol=pickle.HIGHEST_PROTOCOL)
     if evaluation_by_episode:
         print("total collision count is {}, {}%".format(collision_count, round(collision_count / eval_episodes * 100, 2)))
         print("Collision due to bound is {}".format(crash_to_bound))
@@ -219,3 +234,16 @@ def main(config):
         print("Collision to drone {}".format(crash_to_drone))
         print("Destination reached {}".format(sorties_reached))
         print("Idle UAV {}".format(idle_drone))
+
+    return {
+        "total_collision": collision_count,
+        "collision_to_bound": crash_to_bound,
+        "collision_to_building": crash_to_building,
+        "collision_to_drone": crash_to_drone,
+        "destination_reached": sorties_reached,
+        "idle_uav": idle_drone,
+        "evaluation_by_episode": evaluation_by_episode,
+        "all_steps_used": all_steps_used,
+        "reached_goal_drones": drone_reached_per_eps,
+        "total_eval_steps": total_step,
+    }

@@ -2,6 +2,7 @@ import csv
 import os
 import pickle
 import time
+from copy import deepcopy
 from types import SimpleNamespace
 import numpy as np
 
@@ -43,7 +44,10 @@ def _start_episode_run(env_slot, trainer, episode_id, backend):
         n_agents = env_slot["n_agents"]
     else:
         env = env_slot["env"]
-        cur_state, norm_cur_state = env.reset(show=0)
+        if getattr(trainer, "requires_episode_reset", False):
+            cur_state, norm_cur_state = env.reset(episode_id, show=0)
+        else:
+            cur_state, norm_cur_state = env.reset(show=0)
         agent_snapshot = None
         n_agents = env.n_agents
     return {
@@ -232,10 +236,13 @@ def _init_wandb(config):
             "Install it with `pip install wandb` or add it from requirements.txt."
         ) from exc
 
+    os.environ.setdefault("WANDB_DISABLE_GIT", "true")
+    os.environ.setdefault("WANDB_CONSOLE", "off")
     wandb.init(
         project="MARL_2026_combine",
         name=_wandb_run_name(config),
         config=config,
+        save_code=False,
     )
     return wandb
 
@@ -321,6 +328,42 @@ def _build_episode_wandb_log(run, env_cfg, info, dones, current_step, episode_wa
     }
 
 
+def _select_actions(trainer, env_slot, norm_cur_state, evaluate):
+    if hasattr(trainer, "select_action_from_env"):
+        if "env" not in env_slot:
+            raise ValueError("The ORCA algorithm does not support subprocess/vectorized environments.")
+        return trainer.select_action_from_env(env_slot["env"], evaluate=evaluate)
+    return trainer.select_action(norm_cur_state, evaluate=evaluate)
+
+
+def _final_checkpoint_info(stop_mode, episode, total_steps):
+    if stop_mode == "step":
+        return "step", int(total_steps)
+    if stop_mode == "episode":
+        return "ep", int(episode)
+    raise ValueError("Unsupported stop_mode: {}. Expected 'step' or 'episode'.".format(stop_mode))
+
+
+def _write_training_log_header(log_path, checkpoint_dir, checkpoint_kind, checkpoint_value, total_steps, total_wall_clock):
+    with open(log_path, "w") as handle:
+        handle.write("Training Summary\n")
+        handle.write("checkpoint_dir: {}\n".format(checkpoint_dir))
+        handle.write("latest_checkpoint: {}{}\n".format(checkpoint_kind, int(checkpoint_value)))
+        handle.write("total_steps_used: {}\n".format(int(total_steps)))
+        handle.write("total_wall_clock_sec: {:.2f}\n".format(float(total_wall_clock)))
+
+
+def _append_evaluation_log(log_path, eval_summary):
+    with open(log_path, "a") as handle:
+        handle.write("\nEvaluation Summary\n")
+        handle.write("Total collision: {}\n".format(int(eval_summary["total_collision"])))
+        handle.write("Collision to bound: {}\n".format(int(eval_summary["collision_to_bound"])))
+        handle.write("Collision to building: {}\n".format(int(eval_summary["collision_to_building"])))
+        handle.write("Collision to drone: {}\n".format(int(eval_summary["collision_to_drone"])))
+        handle.write("Destination reached: {}\n".format(int(eval_summary["destination_reached"])))
+        handle.write("Idle UAV: {}\n".format(int(eval_summary["idle_uav"])))
+
+
 def main(config):
     training_start_time = time.perf_counter()
     config = create_training_run_dirs(config)
@@ -340,6 +383,9 @@ def main(config):
     stop_target = num_episodes if stop_mode == "episode" else total_steps_budget
     stop_target_name = "episodes" if stop_mode == "episode" else "steps"
     env_template_count = min(num_parallel_envs, stop_target)
+    if config.get("algorithm", "").lower() == "orca":
+        env_template_count = 1
+        num_parallel_envs = 1
     use_subproc_envs = env_template_count > 1
     if use_subproc_envs and env_template_count > 1:
         vec_env = SubprocVecEnv(config, env_template_count)
@@ -403,7 +449,7 @@ def main(config):
                 for run in ready_runs:
                     if hasattr(trainer, "begin_episode"):
                         trainer.begin_episode(run["episode_id"])
-                    run["pending_actions"] = trainer.select_action(run["norm_cur_state"], evaluate=False)
+                    run["pending_actions"] = _select_actions(trainer, run["env_slot"], run["norm_cur_state"], evaluate=False)
                     env_indices.append(run["env_slot"]["env_idx"])
                     action_batch.append(run["pending_actions"])
                 vec_env.step_async(env_indices, action_batch)  # .send() inside is non-blocking. dispatch actions to all environment workers without waiting for their results
@@ -414,7 +460,7 @@ def main(config):
                 for run in ready_runs:
                     if hasattr(trainer, "begin_episode"):
                         trainer.begin_episode(run["episode_id"])
-                    actions = trainer.select_action(run["norm_cur_state"], evaluate=False)
+                    actions = _select_actions(trainer, run["env_slot"], run["norm_cur_state"], evaluate=False)
                     env = run["env_slot"]["env"]
                     step_result = env.step(actions)
                     run["pending_actions"] = actions
@@ -602,6 +648,28 @@ def main(config):
         write.writerows([score_history])
 
     trainer.save(checkpoint_dir, episode=episode, step=total_steps, stop_mode=stop_mode)
+    checkpoint_kind, checkpoint_value = _final_checkpoint_info(stop_mode, episode, total_steps)
     total_wall_clock = time.perf_counter() - training_start_time
+    log_path = os.path.join(checkpoint_dir, "training_eval_summary.txt")
+    _write_training_log_header(
+        log_path,
+        checkpoint_dir,
+        checkpoint_kind,
+        checkpoint_value,
+        total_steps,
+        total_wall_clock,
+    )
+
+    from evaluate import main as evaluate_main
+
+    eval_config = deepcopy(config)
+    eval_config["mode"] = "eval"
+    eval_config["paths"]["checkpoint_dir"] = checkpoint_dir
+    eval_config["paths"]["checkpoint_kind"] = checkpoint_kind
+    eval_config["paths"]["checkpoint_value"] = checkpoint_value
+    eval_summary = evaluate_main(eval_config)
+    _append_evaluation_log(log_path, eval_summary)
+
     print(f"[TRAIN] Total wall-clock time: {total_wall_clock:.2f}s")
     print(f"[TRAIN] Finished. Checkpoints saved to: {checkpoint_dir}")
+    print(f"[TRAIN] Training and evaluation summary saved to: {log_path}")

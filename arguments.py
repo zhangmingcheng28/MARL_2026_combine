@@ -9,28 +9,29 @@ DEFAULT_CONFIG = {
     "device": "auto",
     "dtype": "float32",
     "mode": "eval",  # or evaluate
-    "algorithm": "iddpg",  # or maddpg, maddpg-critic-attention, matd3, matd3-critic-attention, iddpg, fm-iddpg
+    "algorithm": "fm-iddpg",  # or maddpg, maddpg-critic-attention, matd3, matd3-critic-attention, iddpg, fm-iddpg, orca
     "exp_name": "default_exp",
     "save_interval": 5000,
     "paths": {
         "project_root": str(PROJECT_ROOT),
         "resource_env_var": DEFAULT_RESOURCE_ENV_VAR,
         "checkpoint_dir": "checkpoints",
-        "checkpoint_run": "110526_03_22_04",  # this is for evaluation
+        "checkpoint_run": "080526_09_35_18",  # this is for evaluation
         # "checkpoint_run": None,  # this is also used for training folder saving; training uses None
-        "checkpoint_kind": "step",
+        "checkpoint_kind": "step",  # ep
         "checkpoint_value": 450000,
         "resource_file": None,
         "shape_file": "resources/lakesideMap/lakeSide.shp",
         "agent_config_file": "resources/fixedDrone_3drones.xlsx",
         "map_bundle_dir": "resources/precomputed_maps",
         "legacy_code_dir": None,
+        "orca_code_dir": r"F:\githubClone\deepQ_learning_newVer\nf_dqn_v3_2_LSTM_Attention",
     },
     "env": {
-        "n_agents": 12,
+        "n_agents": 8,
         "action_dim": 2,
         "max_steps": 100,
-        "nearest_neighbor_count": 3,
+        "nearest_neighbor_count": 7,
         "grid_obs_shape": [7, 7],
         "bound": [455, 680, 255, 385],
         "max_x": 1800,
@@ -38,7 +39,7 @@ DEFAULT_CONFIG = {
         "grid_length": 10,
         "acc_max": 8,
         "max_speed": 5,
-        "random_map_idx": [3],
+        "random_map_idx": [4, 6, 7],
         "neighbour_search_distance": 100000,
         "full_observable_critic": False,
         "evaluation_by_episode": False,
@@ -83,6 +84,8 @@ DEFAULT_CONFIG = {
         "use_selfatt_with_radar": False,
         "use_all_neigh_with_radar": True,  # for iddpg only, keep it, otherwise training will fail
         "use_critic_attention": False,
+        "use_dec_reward": False,
+        "include_building_in_overall_conflict": True,
         "own_obs_only": False,
     },
     "eval": {
@@ -127,7 +130,7 @@ def get_args():
         "--algo",
         type=str,
         default=DEFAULT_CONFIG["algorithm"],
-        choices=["iddpg", "fm-iddpg", "maddpg", "maddpg-critic-attention", "matd3", "matd3-critic-attention"],
+        choices=["iddpg", "fm-iddpg", "maddpg", "maddpg-critic-attention", "matd3", "matd3-critic-attention", "orca"],
     )
     parser.add_argument("--exp_name", type=str, default=DEFAULT_CONFIG["exp_name"])
 
@@ -196,6 +199,12 @@ def get_args():
     parser.add_argument("--use_selfatt_with_radar", action="store_true", default=DEFAULT_CONFIG["flags"]["use_selfatt_with_radar"])
     parser.add_argument("--use_all_neigh_with_radar", action="store_true", default=DEFAULT_CONFIG["flags"]["use_all_neigh_with_radar"])
     parser.add_argument("--use_critic_attention", action="store_true", default=DEFAULT_CONFIG["flags"]["use_critic_attention"])
+    parser.add_argument("--use_dec_reward", action="store_true", default=DEFAULT_CONFIG["flags"]["use_dec_reward"])
+    parser.add_argument(
+        "--include_building_in_overall_conflict",
+        action="store_true",
+        default=DEFAULT_CONFIG["flags"]["include_building_in_overall_conflict"],
+    )
     parser.add_argument("--own_obs_only", action="store_true", default=DEFAULT_CONFIG["flags"]["own_obs_only"])
 
     parser.add_argument("--device", type=str, default=DEFAULT_CONFIG["device"])
@@ -212,6 +221,7 @@ def get_args():
     parser.add_argument("--agent_config_file", type=str, default=DEFAULT_CONFIG["paths"]["agent_config_file"])
     parser.add_argument("--map_bundle_dir", type=str, default=DEFAULT_CONFIG["paths"]["map_bundle_dir"])
     parser.add_argument("--legacy_code_dir", type=str, default=DEFAULT_CONFIG["paths"]["legacy_code_dir"])
+    parser.add_argument("--orca_code_dir", type=str, default=DEFAULT_CONFIG["paths"]["orca_code_dir"])
 
     return parser.parse_args()
 
@@ -242,6 +252,7 @@ def build_config(args):
     config["paths"]["agent_config_file"] = resolve_path(args.agent_config_file)
     config["paths"]["map_bundle_dir"] = _resolve_optional_path(args.map_bundle_dir)
     config["paths"]["legacy_code_dir"] = _resolve_optional_path(args.legacy_code_dir)
+    config["paths"]["orca_code_dir"] = _resolve_optional_path(args.orca_code_dir)
 
     config["env"]["n_agents"] = args.n_agents
     config["env"]["action_dim"] = args.action_dim
@@ -294,6 +305,8 @@ def build_config(args):
         "maddpg-critic-attention",
         "matd3-critic-attention",
     )
+    config["flags"]["use_dec_reward"] = args.use_dec_reward
+    config["flags"]["include_building_in_overall_conflict"] = args.include_building_in_overall_conflict
     config["flags"]["own_obs_only"] = args.own_obs_only
 
     config["env"]["full_observable_critic"] = config["flags"]["full_observable_critic"]

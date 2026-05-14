@@ -921,7 +921,7 @@ class SharedMultiAgentEnv:
         outPoly.append([gridPoly_ones, gridPoly_zero])
         return env_map_bounded, polySet_buildings, outPoly
 
-    def reset(self, show=0):
+    def reset(self, episode, show=0):
 
         # reset OU_noise as well
         self.OU_noise.reset()
@@ -935,9 +935,10 @@ class SharedMultiAgentEnv:
         random_end_pos_collection = []
         # repeat simulation
         # with open(
-        #         r'repeat_OD_for_display_config4.pickle', 'rb') as handle:
+        #         r'F:\githubClone\MARL_2nd_paper\80%_sortie_reach_change_map_HS\repeat_OD_for_orca_uav_5.pickle', 'rb') as handle:
         #     OD_eta_record = pickle.load(handle)
-        #     agent_ODs = OD_eta_record[0]
+        #     agent_ODs = OD_eta_record[episode-1]
+
         for agentIdx in self.all_uavs.keys():
 
             # ---------------- using random initialized agent position for traffic flow ---------
@@ -993,8 +994,8 @@ class SharedMultiAgentEnv:
             # random_end_pos = random_end_pos_list[agentIdx]
 
             # repeat simulation
-            # random_start_pos = tuple(agent_ODs[agentIdx][1])
-            # random_end_pos = tuple(agent_ODs[agentIdx][0][-1])
+            # random_start_pos = tuple(agent_ODs[0][agentIdx][1])
+            # random_end_pos = tuple(agent_ODs[0][agentIdx][0][-1])
 
             self.all_uavs[agentIdx].pos = np.array(random_start_pos)
             self.all_uavs[agentIdx].pre_pos = np.array(random_start_pos)
@@ -2179,7 +2180,83 @@ class SharedMultiAgentEnv:
         status_holder[drone_idx]['A'+str(drone_idx)+'_observable space'] = cur_step_reward[9]
         status_holder[drone_idx]['A'+str(drone_idx)+'_heading'] = cur_step_reward[10]
         status_holder[drone_idx]['near_drone_penalty'] = cur_step_reward[11]
+        status_holder[drone_idx]['dec_score'] = cur_step_reward[12]
+        status_holder[drone_idx]['overall_potential_conflict_current_t'] = cur_step_reward[13]
         return status_holder
+
+    def _dec_generation(self, drone_idx, drone_obj):
+        t_cpa_tresh_second = 2
+        cur_total_possible_conflict = 0
+        pre_total_possible_conflict = 0
+        previous_potential_conflict = []
+        current_potential_conflict = []
+
+        for neigh_keys in drone_obj.surroundingNeighbor:
+            if (
+                self.all_uavs[neigh_keys].drone_collision is True
+                or self.all_uavs[neigh_keys].building_collision is True
+                or self.all_uavs[neigh_keys].reach_target is True
+                or self.all_uavs[neigh_keys].bound_collision is True
+            ):
+                continue
+            tcpa, d_tcpa, _ = compute_t_cpa_d_cpa_potential_col(
+                self.all_uavs[neigh_keys].pos, drone_obj.pos, self.all_uavs[neigh_keys].vel, drone_obj.vel,
+                self.all_uavs[neigh_keys].protectiveBound, drone_obj.protectiveBound, cur_total_possible_conflict)
+            if tcpa >= 0 and tcpa < (t_cpa_tresh_second / self.time_step) and d_tcpa <= drone_obj.protectiveBound * 2:
+                current_potential_conflict.append(neigh_keys)
+
+            pre_tcpa, pre_d_tcpa, _ = compute_t_cpa_d_cpa_potential_col(
+                self.all_uavs[neigh_keys].pre_pos, drone_obj.pre_pos, self.all_uavs[neigh_keys].pre_vel,
+                drone_obj.pre_vel, self.all_uavs[neigh_keys].protectiveBound, drone_obj.protectiveBound,
+                pre_total_possible_conflict)
+            if pre_tcpa >= 0 and pre_tcpa < (t_cpa_tresh_second / self.time_step) and d_tcpa <= drone_obj.protectiveBound * 2:
+                previous_potential_conflict.append(neigh_keys)
+
+        dist_array = np.array([dist_info for dist_info in drone_obj.observableSpace])
+        ascending_array = np.sort(dist_array)
+        min_index = np.argmin(dist_array)
+        min_dist = dist_array[min_index]
+
+        cur_building_conflict = 0
+        pre_building_conflict = 0
+
+        if np.linalg.norm(drone_obj.vel) == 0:
+            t_cpa_building_second = 9999
+        else:
+            t_cpa_building_second = min_dist / np.linalg.norm(drone_obj.vel)
+        t_cpa_building_sim_step = t_cpa_building_second / self.time_step
+        if (t_cpa_building_sim_step < t_cpa_tresh_second / self.time_step) and (min_dist <= drone_obj.protectiveBound * 2):
+            cur_building_conflict = cur_building_conflict + 1
+
+        if np.linalg.norm(drone_obj.pre_vel) == 0:
+            pre_t_cpa_building_second = 9999
+        else:
+            pre_t_cpa_building_second = min_dist / np.linalg.norm(drone_obj.pre_vel)
+        pre_t_cpa_building_sim_step = pre_t_cpa_building_second / self.time_step
+        if pre_t_cpa_building_sim_step < t_cpa_tresh_second / self.time_step:
+            pre_building_conflict = pre_building_conflict + 1
+
+        dec_coeff = 1
+        if len(previous_potential_conflict) + pre_building_conflict == 0 and len(
+                current_potential_conflict) + cur_building_conflict == 0:
+            dec = 0
+        elif len(previous_potential_conflict) + pre_building_conflict == 0 and len(
+                current_potential_conflict) + cur_building_conflict != 0:
+            dec = 1
+        else:
+            dec = ((len(current_potential_conflict) + cur_building_conflict) - (
+                        len(previous_potential_conflict) + pre_building_conflict)) / (len(
+                previous_potential_conflict) + pre_building_conflict)
+            if dec > 1:
+                dec = 1
+        dec_score = dec_coeff * dec
+
+        if self.flags.get("include_building_in_overall_conflict", False):
+            overall_potential_conflict = len(current_potential_conflict) + cur_building_conflict
+        else:
+            overall_potential_conflict = len(current_potential_conflict)
+
+        return dec_score, overall_potential_conflict
 
     def ss_reward_Mar(
             self,
@@ -2444,6 +2521,10 @@ class SharedMultiAgentEnv:
             else:
                 near_building_penalty = 0
 
+            dec_score, overall_potential_conflict_current_t = self._dec_generation(drone_idx, drone_obj)
+            if not self.flags.get("use_dec_reward", False):
+                dec_score = 0.0
+
             if reached_before_step:
                 check_goal[drone_idx] = True
                 agent_to_remove.append(drone_idx)
@@ -2490,7 +2571,7 @@ class SharedMultiAgentEnv:
                 if xy[0] is None and xy[1] is None:
                     if wp_intersect_flag and len(drone_obj.waypoints) > 1:
                         drone_obj.removed_goal = drone_obj.waypoints.pop(0)
-                rew = rew + dist_to_ref_line + dist_to_goal - small_step_penalty + near_goal_reward - near_building_penalty + seg_reward - survival_penalty - near_drone_penalty - surrounding_collision_penalty
+                rew = rew + dist_to_ref_line + dist_to_goal - small_step_penalty + near_goal_reward - near_building_penalty + seg_reward - survival_penalty - near_drone_penalty - surrounding_collision_penalty + dec_score
                 done.append(False)
                 reward.append(np.array(rew))
 
@@ -2504,7 +2585,8 @@ class SharedMultiAgentEnv:
                     np.array(near_building_penalty), small_step_penalty,
                     np.linalg.norm(drone_obj.vel), near_goal_reward,
                     seg_reward, nearest_pt, drone_obj.observableSpace,
-                    drone_obj.heading, np.array(near_drone_penalty),
+                    drone_obj.heading, np.array(near_drone_penalty), np.array(dec_score),
+                    overall_potential_conflict_current_t,
                 ],
             )
 

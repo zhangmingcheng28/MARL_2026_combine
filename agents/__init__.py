@@ -2,6 +2,7 @@ from agents.fm_iddpg.trainer import FMIDDPGTrainer
 from agents.iddpg.trainer import IDDPGTrainer
 from agents.maddpg.trainer import MADDPGTrainer
 from agents.matd3.trainer import MATD3Trainer
+from agents.orca.trainer import ORCATrainer
 
 
 def build_trainer(args):
@@ -15,5 +16,7 @@ def build_trainer(args):
         return MADDPGTrainer(args)
     elif algo in ("matd3", "matd3-critic-attention"):
         return MATD3Trainer(args)
+    elif algo == "orca":
+        return ORCATrainer(args)
     else:
         raise ValueError(f"Unknown algorithm: {args['algorithm']}")
