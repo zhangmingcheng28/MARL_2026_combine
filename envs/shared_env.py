@@ -921,7 +921,12 @@ class SharedMultiAgentEnv:
         outPoly.append([gridPoly_ones, gridPoly_zero])
         return env_map_bounded, polySet_buildings, outPoly
 
-    def reset(self, episode, show=0):
+    def reset(self, episode=None, show=0):
+        if episode is None:
+            self.episode_count += 1
+            episode = self.episode_count
+        else:
+            self.episode_count = int(episode)
 
         # reset OU_noise as well
         self.OU_noise.reset()

@@ -37,6 +37,8 @@ class MATD3Trainer(BaseTrainer):
         self.policy_noise = float(config["train"].get("policy_noise", 0.2))
         self.noise_clip = float(config["train"].get("noise_clip", 0.5))
         self.policy_delay = max(1, int(config["train"].get("policy_delay", 2)))
+        self.l2_reg = float(config["train"].get("matd3_l2_reg", 0.0))
+        self.non_stationary_adam = bool(config["train"].get("matd3_non_stationary_adam", False))
         self.learning_starts = max(
             self.batch_size,
             int(config["train"].get("learning_starts", self.batch_size)),
@@ -168,9 +170,25 @@ class MATD3Trainer(BaseTrainer):
         self.target_critic1 = deepcopy(self.critic1).to(device=self.device, dtype=self.torch_dtype)
         self.target_critic2 = deepcopy(self.critic2).to(device=self.device, dtype=self.torch_dtype)
 
-        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=self.config["train"]["actor_lr"])
-        self.critic1_optimizer = optim.Adam(self.critic1.parameters(), lr=self.config["train"]["critic_lr"])
-        self.critic2_optimizer = optim.Adam(self.critic2.parameters(), lr=self.config["train"]["critic_lr"])
+        optimizer_kwargs = {
+            "weight_decay": self.l2_reg,
+            "amsgrad": self.non_stationary_adam,
+        }
+        self.actor_optimizer = optim.Adam(
+            self.actor.parameters(),
+            lr=self.config["train"]["actor_lr"],
+            **optimizer_kwargs,
+        )
+        self.critic1_optimizer = optim.Adam(
+            self.critic1.parameters(),
+            lr=self.config["train"]["critic_lr"],
+            **optimizer_kwargs,
+        )
+        self.critic2_optimizer = optim.Adam(
+            self.critic2.parameters(),
+            lr=self.config["train"]["critic_lr"],
+            **optimizer_kwargs,
+        )
 
         if self.pending_load_path is not None:
             self._load_state(*self.pending_load_path)
@@ -376,6 +394,8 @@ class MATD3Trainer(BaseTrainer):
             "learning_starts": self.learning_starts,
             "batch_size": self.batch_size,
             "policy_delay": self.policy_delay,
+            "l2_reg": self.l2_reg,
+            "non_stationary_adam": self.non_stationary_adam,
             "policy_noise": self.policy_noise,
             "noise_clip": self.noise_clip,
             "max_grad_norm": self.max_grad_norm,

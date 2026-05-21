@@ -1,17 +1,18 @@
 import os
+from copy import deepcopy
+
 import numpy as np
 import torch
 import torch.nn.functional as F
 import torch.optim as optim
-from copy import deepcopy
 
 from agents.base_trainer import BaseTrainer
 from agents.common.buffer import ReplayBuffer
 from agents.common.utils import soft_update
-from agents.maddpg.networks import Actor, AttentionCentralCritic, EmbeddedCentralCritic
+from agents.maac.networks import Actor, MAACAttentionCritic
 
 
-class MADDPGTrainer(BaseTrainer):
+class MAACTrainer(BaseTrainer):
     def __init__(self, config):
         super().__init__(config)
 
@@ -26,12 +27,9 @@ class MADDPGTrainer(BaseTrainer):
         self.tau = config["train"]["tau"]
         self.batch_size = config["train"]["batch_size"]
         self.update_every = config["train"]["update_every"]
+        self.max_grad_norm = float(config["train"].get("max_grad_norm", 0.0))
+        self.attention_heads = int(config["train"].get("maac_attend_heads", 4))
         self.exploration = config.get("exploration", {})
-        self.flags = config.get("flags", {})
-        self.use_critic_attention = (
-            self.flags.get("use_critic_attention", False)
-            or config.get("algorithm", "").lower() == "maddpg-critic-attention"
-        )
 
         self.obs_dim = None
         self.obs_split_dims = None
@@ -47,7 +45,6 @@ class MADDPGTrainer(BaseTrainer):
         self.pending_load_path = None
 
         self.buffer = ReplayBuffer(config["train"]["buffer_size"])
-        self.max_grad_norm = float(config["train"].get("max_grad_norm", 0.0))
         self.last_action_info = {}
         self.last_update_info = {
             "update_performed": False,
@@ -110,13 +107,6 @@ class MADDPGTrainer(BaseTrainer):
             start = end
         return split_tensors
 
-    def _build_actor_input_from_raw_obs(self, obs, agent_idx):
-        return [
-            torch.tensor(np.asarray(obs[0][agent_idx]), dtype=self.torch_dtype, device=self.device).reshape(1, -1),
-            torch.tensor(np.asarray(obs[1][agent_idx]), dtype=self.torch_dtype, device=self.device).reshape(1, -1),
-            torch.tensor(np.asarray(obs[2][agent_idx]), dtype=self.torch_dtype, device=self.device).reshape(1, -1),
-        ]
-
     def _split_obs_batch(self, obs_batch, agent_idx):
         return self._split_actor_obs_tensor(obs_batch[:, agent_idx, :])
 
@@ -135,14 +125,14 @@ class MADDPGTrainer(BaseTrainer):
         if self.obs_dim is not None:
             if inferred_obs_dim != self.obs_dim:
                 raise ValueError(
-                    "MADDPG observation dimension changed from {} to {}.".format(
+                    "MAAC observation dimension changed from {} to {}.".format(
                         self.obs_dim,
                         inferred_obs_dim,
                     )
                 )
             if inferred_split_dims != self.obs_split_dims:
                 raise ValueError(
-                    "MADDPG observation split changed from {} to {}.".format(
+                    "MAAC observation split changed from {} to {}.".format(
                         self.obs_split_dims,
                         inferred_split_dims,
                     )
@@ -156,11 +146,13 @@ class MADDPGTrainer(BaseTrainer):
             dtype=self.torch_dtype,
         )
         self.target_actor = deepcopy(self.actor).to(device=self.device, dtype=self.torch_dtype)
-        critic_cls = AttentionCentralCritic if self.use_critic_attention else EmbeddedCentralCritic
-        self.critic = critic_cls(self.obs_split_dims, self.n_agents, self.action_dim, self.hidden_dim).to(
-            device=self.device,
-            dtype=self.torch_dtype,
-        )
+        self.critic = MAACAttentionCritic(
+            self.obs_split_dims,
+            self.n_agents,
+            self.action_dim,
+            self.hidden_dim,
+            attention_heads=self.attention_heads,
+        ).to(device=self.device, dtype=self.torch_dtype)
         self.target_critic = deepcopy(self.critic).to(device=self.device, dtype=self.torch_dtype)
 
         self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=self.config["train"]["actor_lr"])
@@ -226,13 +218,17 @@ class MADDPGTrainer(BaseTrainer):
         flat_dones = np.asarray(dones, dtype=np.float32)
         self.buffer.push(flat_obs, flat_actions, flat_rewards, flat_next_obs, flat_dones)
 
+    def _clip_grad_norm(self, parameters):
+        if self.max_grad_norm > 0:
+            torch.nn.utils.clip_grad_norm_(parameters, self.max_grad_norm)
+
     def update(self, i_episode=None, total_step_count=None, single_eps_critic_cal_record=None):
         if single_eps_critic_cal_record is None:
             single_eps_critic_cal_record = []
         self.last_update_info = {
             "update_performed": False,
             "actor_updated": False,
-            "update_step": 0 if i_episode is None else int(i_episode),
+            "update_step": int(i_episode if i_episode is not None else self.current_episode),
             "buffer_size": len(self.buffer),
             "learning_starts": self.batch_size,
             "batch_size": self.batch_size,
@@ -267,75 +263,59 @@ class MADDPGTrainer(BaseTrainer):
         done_means = []
 
         self.critic_optimizer.zero_grad()
+        with torch.no_grad():
+            next_actions_all = torch.stack(
+                [self.target_actor(self._split_obs_batch(next_obs_all, other_i)) for other_i in range(self.n_agents)],
+                dim=1,
+            )
         for agent_i in range(self.n_agents):
             rewards = rewards_all[:, agent_i : agent_i + 1]
             dones = dones_all[:, agent_i : agent_i + 1]
-            agent_index = torch.full(
-                (self.batch_size,),
-                agent_i,
-                dtype=torch.long,
-                device=self.device,
-            )
+            agent_index = torch.full((self.batch_size,), agent_i, dtype=torch.long, device=self.device)
+
             with torch.no_grad():
-                next_actions_list = []
-                for other_i in range(self.n_agents):
-                    next_actions_list.append(self.target_actor(self._split_obs_batch(next_obs_all, other_i)))
-                next_actions_all = torch.stack(next_actions_list, dim=1)
-                target_q = self.target_critic(
-                    split_next_obs_all,
-                    next_actions_all,
-                    agent_index,
-                )
+                target_q = self.target_critic(split_next_obs_all, next_actions_all, agent_index)
                 y = rewards + self.gamma * (1 - dones) * target_q
                 target_q_means.append(target_q.detach().mean())
                 y_means.append(y.detach().mean())
                 reward_means.append(rewards.detach().mean())
                 done_means.append(dones.detach().mean())
-            current_q = self.critic(
+
+            current_q, regs = self.critic(
                 split_obs_all,
                 actions_all,
                 agent_index,
+                regularize=True,
             )
             q_means.append(current_q.detach().mean())
             critic_loss_i = F.mse_loss(current_q, y)
+            if regs:
+                critic_loss_i = critic_loss_i + sum(regs)
             critic_losses.append(critic_loss_i.detach())
             critic_loss_i.backward(retain_graph=agent_i < self.n_agents - 1)
         critic_grad_norm = self._grad_norm(self.critic.parameters())
-        if self.max_grad_norm > 0:
-            torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
+        self._clip_grad_norm(self.critic.parameters())
         self.critic_optimizer.step()
 
         self.actor_optimizer.zero_grad()
         for agent_i in range(self.n_agents):
-            current_obs_i = self._split_obs_batch(obs_all, agent_i)
-            # Original MADDPG-style actor update:
-            # replace only the current agent's action with the actor output,
-            # while keeping the other agents' actions fixed from replay.
-            mixed_actions = actions_all.detach().clone()
-            agent_actions = self.actor(current_obs_i)
-            mixed_actions[:, agent_i, :] = agent_actions
-            agent_index = torch.full(
-                (self.batch_size,),
-                agent_i,
-                dtype=torch.long,
-                device=self.device,
-            )
+            policy_actions = []
+            for other_i in range(self.n_agents):
+                sampled_action = self.actor(self._split_obs_batch(obs_all, other_i))
+                if other_i != agent_i:
+                    sampled_action = sampled_action.detach()
+                policy_actions.append(sampled_action)
+            policy_actions_all = torch.stack(policy_actions, dim=1)
+            agent_index = torch.full((self.batch_size,), agent_i, dtype=torch.long, device=self.device)
             actor_loss_i = -self.critic(
                 split_obs_all,
-                mixed_actions,
+                policy_actions_all,
                 agent_index,
             ).mean()
             actor_losses.append(actor_loss_i.detach())
             actor_loss_i.backward(retain_graph=agent_i < self.n_agents - 1)
-
-            # Previous local-critic version kept for reference only.
-            # It reduced MADDPG to a more IDDPG-like update because the critic only
-            # saw one agent's local observation and action.
-            # actor_loss_i = -self.critic(current_obs_i[0], current_obs_i[1], current_obs_i[2], agent_actions).mean()
-            # actor_loss_i.backward(retain_graph=agent_i < self.n_agents - 1)
         actor_grad_norm = self._grad_norm(self.actor.parameters())
-        if self.max_grad_norm > 0:
-            torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
+        self._clip_grad_norm(self.actor.parameters())
         self.actor_optimizer.step()
 
         update_index = self.current_episode if i_episode is None else i_episode
@@ -386,20 +366,20 @@ class MADDPGTrainer(BaseTrainer):
             raise ValueError("Unsupported stop_mode: {}. Expected 'step' or 'episode'.".format(stop_mode))
 
         os.makedirs(path, exist_ok=True)
-        actor_path = os.path.join(path, "maddpg_actor.pt")
-        critic_path = os.path.join(path, "maddpg_critic.pt")
+        actor_path = os.path.join(path, "maac_actor.pt")
+        critic_path = os.path.join(path, "maac_critic.pt")
         torch.save(self.actor.state_dict(), actor_path)
         torch.save(self.critic.state_dict(), critic_path)
         if episode is not None:
-            torch.save(self.actor.state_dict(), os.path.join(path, f"maddpg_actor_ep{int(episode)}.pt"))
-            torch.save(self.critic.state_dict(), os.path.join(path, f"maddpg_critic_ep{int(episode)}.pt"))
+            torch.save(self.actor.state_dict(), os.path.join(path, f"maac_actor_ep{int(episode)}.pt"))
+            torch.save(self.critic.state_dict(), os.path.join(path, f"maac_critic_ep{int(episode)}.pt"))
         if step is not None:
-            torch.save(self.actor.state_dict(), os.path.join(path, f"maddpg_actor_step{int(step)}.pt"))
-            torch.save(self.critic.state_dict(), os.path.join(path, f"maddpg_critic_step{int(step)}.pt"))
+            torch.save(self.actor.state_dict(), os.path.join(path, f"maac_actor_step{int(step)}.pt"))
+            torch.save(self.critic.state_dict(), os.path.join(path, f"maac_critic_step{int(step)}.pt"))
 
     def _load_state(self, path, checkpoint_tag=None):
-        actor_name = "maddpg_actor.pt" if checkpoint_tag is None else f"maddpg_actor_{checkpoint_tag}.pt"
-        critic_name = "maddpg_critic.pt" if checkpoint_tag is None else f"maddpg_critic_{checkpoint_tag}.pt"
+        actor_name = "maac_actor.pt" if checkpoint_tag is None else f"maac_actor_{checkpoint_tag}.pt"
+        critic_name = "maac_critic.pt" if checkpoint_tag is None else f"maac_critic_{checkpoint_tag}.pt"
         self.actor.load_state_dict(torch.load(os.path.join(path, actor_name), map_location=self.device))
         self.critic.load_state_dict(torch.load(os.path.join(path, critic_name), map_location=self.device))
         self.target_actor.load_state_dict(self.actor.state_dict())

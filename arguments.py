@@ -8,15 +8,15 @@ DEFAULT_CONFIG = {
     "seed": 777,
     "device": "auto",
     "dtype": "float32",
-    "mode": "eval",  # or evaluate
-    "algorithm": "fm-iddpg",  # or maddpg, maddpg-critic-attention, matd3, matd3-critic-attention, iddpg, fm-iddpg, orca
+    "mode": "evaluate",  # or evaluate
+    "algorithm": "matd3",  # or maddpg, maddpg-critic-attention, maac, matd3, matd3-critic-attention, iddpg, fm-iddpg, orca
     "exp_name": "default_exp",
     "save_interval": 5000,
     "paths": {
         "project_root": str(PROJECT_ROOT),
         "resource_env_var": DEFAULT_RESOURCE_ENV_VAR,
         "checkpoint_dir": "checkpoints",
-        "checkpoint_run": "080526_09_35_18",  # this is for evaluation
+        "checkpoint_run": "190526_09_31_31",  # this is for evaluation
         # "checkpoint_run": None,  # this is also used for training folder saving; training uses None
         "checkpoint_kind": "step",  # ep
         "checkpoint_value": 450000,
@@ -31,7 +31,7 @@ DEFAULT_CONFIG = {
         "n_agents": 8,
         "action_dim": 2,
         "max_steps": 100,
-        "nearest_neighbor_count": 7,
+        "nearest_neighbor_count": 3,
         "grid_obs_shape": [7, 7],
         "bound": [455, 680, 255, 385],
         "max_x": 1800,
@@ -39,7 +39,7 @@ DEFAULT_CONFIG = {
         "grid_length": 10,
         "acc_max": 8,
         "max_speed": 5,
-        "random_map_idx": [4, 6, 7],
+        "random_map_idx": [0, 2, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14],
         "neighbour_search_distance": 100000,
         "full_observable_critic": False,
         "evaluation_by_episode": False,
@@ -60,6 +60,8 @@ DEFAULT_CONFIG = {
         "learning_starts": 1000,
         "max_grad_norm": 0.0,
         "feature_matching_lambda": 0.002,
+        "matd3_l2_reg": 0.0,
+        "matd3_non_stationary_adam": False,
         "policy_noise": 0,
         "noise_clip": 0,
         "policy_delay": 1,
@@ -130,7 +132,7 @@ def get_args():
         "--algo",
         type=str,
         default=DEFAULT_CONFIG["algorithm"],
-        choices=["iddpg", "fm-iddpg", "maddpg", "maddpg-critic-attention", "matd3", "matd3-critic-attention", "orca"],
+        choices=["iddpg", "fm-iddpg", "maddpg", "maddpg-critic-attention", "maac", "matd3", "matd3-critic-attention", "orca"],
     )
     parser.add_argument("--exp_name", type=str, default=DEFAULT_CONFIG["exp_name"])
 
@@ -176,6 +178,12 @@ def get_args():
         "--feature_matching_lambda",
         type=float,
         default=DEFAULT_CONFIG["train"]["feature_matching_lambda"],
+    )
+    parser.add_argument("--matd3_l2_reg", type=float, default=DEFAULT_CONFIG["train"]["matd3_l2_reg"])
+    parser.add_argument(
+        "--matd3_non_stationary_adam",
+        action="store_true",
+        default=DEFAULT_CONFIG["train"]["matd3_non_stationary_adam"],
     )
     parser.add_argument("--policy_noise", type=float, default=DEFAULT_CONFIG["train"]["policy_noise"])
     parser.add_argument("--noise_clip", type=float, default=DEFAULT_CONFIG["train"]["noise_clip"])
@@ -280,6 +288,8 @@ def build_config(args):
     config["train"]["learning_starts"] = args.learning_starts
     config["train"]["max_grad_norm"] = args.max_grad_norm
     config["train"]["feature_matching_lambda"] = args.feature_matching_lambda
+    config["train"]["matd3_l2_reg"] = args.matd3_l2_reg
+    config["train"]["matd3_non_stationary_adam"] = args.matd3_non_stationary_adam
     config["train"]["policy_noise"] = args.policy_noise
     config["train"]["noise_clip"] = args.noise_clip
     config["train"]["policy_delay"] = args.policy_delay

@@ -40,14 +40,11 @@ def _start_episode_run(env_slot, trainer, episode_id, backend):
     if hasattr(trainer, "begin_episode"):
         trainer.begin_episode(episode_id)
     if backend == "subproc":
-        cur_state, norm_cur_state, agent_snapshot = env_slot["vec_env"].reset_at(env_slot["env_idx"])
+        cur_state, norm_cur_state, agent_snapshot = env_slot["vec_env"].reset_at(env_slot["env_idx"], episode_id)
         n_agents = env_slot["n_agents"]
     else:
         env = env_slot["env"]
-        if getattr(trainer, "requires_episode_reset", False):
-            cur_state, norm_cur_state = env.reset(episode_id, show=0)
-        else:
-            cur_state, norm_cur_state = env.reset(show=0)
+        cur_state, norm_cur_state = env.reset(episode_id, show=0)
         agent_snapshot = None
         n_agents = env.n_agents
     return {
@@ -289,10 +286,11 @@ def _build_step_wandb_log(run, trainer, info, rewards, dones, total_steps, curre
         "env/collision_nearest_drone": int(bool(collision_flags[3])),
         "env/collision_any": int(any(bool(flag) for flag in collision_flags[:3])),
     }
+    algorithm_name = str(getattr(trainer, "config", {}).get("algorithm", "algorithm")).replace("-", "_")
     metrics.update(_agent_step_wandb_metrics(actions, rewards_arr, dones_arr, check_goal))
     metrics.update(_status_holder_wandb_metrics(info))
-    metrics.update(_prefixed_metrics("matd3_action", getattr(trainer, "last_action_info", {})))
-    metrics.update(_prefixed_metrics("matd3_update", getattr(trainer, "last_update_info", {})))
+    metrics.update(_prefixed_metrics(f"{algorithm_name}_action", getattr(trainer, "last_action_info", {})))
+    metrics.update(_prefixed_metrics(f"{algorithm_name}_update", getattr(trainer, "last_update_info", {})))
     return metrics
 
 
@@ -362,6 +360,14 @@ def _append_evaluation_log(log_path, eval_summary):
         handle.write("Collision to drone: {}\n".format(int(eval_summary["collision_to_drone"])))
         handle.write("Destination reached: {}\n".format(int(eval_summary["destination_reached"])))
         handle.write("Idle UAV: {}\n".format(int(eval_summary["idle_uav"])))
+
+
+def _append_evaluation_status(log_path, status, message=None):
+    with open(log_path, "a") as handle:
+        handle.write("\nEvaluation Status\n")
+        handle.write("status: {}\n".format(status))
+        if message:
+            handle.write("message: {}\n".format(message))
 
 
 def main(config):
@@ -659,6 +665,7 @@ def main(config):
         total_steps,
         total_wall_clock,
     )
+    _append_evaluation_status(log_path, "pending", "Post-training evaluation has started.")
 
     from evaluate import main as evaluate_main
 
@@ -667,7 +674,12 @@ def main(config):
     eval_config["paths"]["checkpoint_dir"] = checkpoint_dir
     eval_config["paths"]["checkpoint_kind"] = checkpoint_kind
     eval_config["paths"]["checkpoint_value"] = checkpoint_value
-    eval_summary = evaluate_main(eval_config)
+    try:
+        eval_summary = evaluate_main(eval_config)
+    except Exception as exc:
+        _append_evaluation_status(log_path, "failed", repr(exc))
+        raise
+    _append_evaluation_status(log_path, "completed")
     _append_evaluation_log(log_path, eval_summary)
 
     print(f"[TRAIN] Total wall-clock time: {total_wall_clock:.2f}s")

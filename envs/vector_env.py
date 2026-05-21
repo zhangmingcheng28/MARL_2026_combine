@@ -1,7 +1,15 @@
 import multiprocessing as mp
+import random
 from copy import deepcopy
 
+import numpy as np
+
 from envs.shared_env import SharedMultiAgentEnv
+
+try:
+    import torch
+except ImportError:  # pragma: no cover
+    torch = None
 
 
 def _extract_agent_snapshot(env):
@@ -22,14 +30,33 @@ def _extract_agent_snapshot(env):
     return snapshot
 
 
-def _worker(remote, parent_remote, config):
+def _set_worker_seed(base_seed, worker_idx):
+    seed = int(base_seed) + int(worker_idx)
+    random.seed(seed)
+    np.random.seed(seed)
+    if torch is not None:
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed(seed)
+            torch.cuda.manual_seed_all(seed)
+        if hasattr(torch.backends, "cudnn"):
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
+        try:
+            torch.use_deterministic_algorithms(True, warn_only=True)
+        except (AttributeError, TypeError):
+            pass
+
+
+def _worker(remote, parent_remote, config, worker_idx):
     parent_remote.close()
+    _set_worker_seed(config.get("seed", 777), worker_idx)
     env = SharedMultiAgentEnv.from_config(config)
     try:
         while True:
             command, data = remote.recv()
             if command == "reset":
-                cur_state, norm_cur_state = env.reset(show=0)
+                cur_state, norm_cur_state = env.reset(data, show=0)
                 remote.send((cur_state, norm_cur_state, _extract_agent_snapshot(env)))
             elif command == "step":
                 next_state_norm, next_state, rewards, dones, info = env.step(data)
@@ -57,11 +84,11 @@ class SubprocVecEnv:
         self._remotes = []
         self._processes = []
 
-        for _ in range(self.num_envs):
+        for worker_idx in range(self.num_envs):
             parent_remote, child_remote = self._ctx.Pipe()
             process = self._ctx.Process(
                 target=_worker,
-                args=(child_remote, parent_remote, deepcopy(config)),
+                args=(child_remote, parent_remote, deepcopy(config), worker_idx),
                 daemon=True,
             )
             process.start()
@@ -69,13 +96,26 @@ class SubprocVecEnv:
             self._remotes.append(parent_remote)
             self._processes.append(process)
 
-    def reset_at(self, env_idx):
-        self._remotes[env_idx].send(("reset", None))
-        return self._remotes[env_idx].recv()
+    def _format_worker_failure(self, env_idx):
+        process = self._processes[env_idx]
+        return "Subprocess environment {} terminated unexpectedly (exitcode={}).".format(
+            env_idx,
+            process.exitcode,
+        )
+
+    def reset_at(self, env_idx, episode):
+        self._remotes[env_idx].send(("reset", episode))
+        try:
+            return self._remotes[env_idx].recv()
+        except EOFError as exc:
+            raise RuntimeError(self._format_worker_failure(env_idx)) from exc
 
     def step_at(self, env_idx, actions):
         self._remotes[env_idx].send(("step", actions))
-        return self._remotes[env_idx].recv()
+        try:
+            return self._remotes[env_idx].recv()
+        except EOFError as exc:
+            raise RuntimeError(self._format_worker_failure(env_idx)) from exc
 
     def step_async(self, env_indices, actions_batch):
         for env_idx, actions in zip(env_indices, actions_batch):
@@ -84,7 +124,10 @@ class SubprocVecEnv:
     def step_wait(self, env_indices):
         results = []
         for env_idx in env_indices:
-            results.append(self._remotes[env_idx].recv())  # the main process “Pause here until data arrives from that worker.”
+            try:
+                results.append(self._remotes[env_idx].recv())
+            except EOFError as exc:
+                raise RuntimeError(self._format_worker_failure(env_idx)) from exc
         return results
 
     def close(self):

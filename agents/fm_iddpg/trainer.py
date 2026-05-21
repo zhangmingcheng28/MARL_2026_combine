@@ -43,6 +43,36 @@ class FMIDDPGTrainer(BaseTrainer):
         self.action_step = 0
         self.current_episode = 1
         self.pending_load_path = None
+        self.max_grad_norm = float(config["train"].get("max_grad_norm", 0.0))
+        self.last_action_info = {}
+        self.last_update_info = {
+            "update_performed": False,
+            "actor_updated": False,
+            "update_step": 0,
+            "buffer_size": 0,
+            "learning_starts": self.batch_size,
+            "batch_size": self.batch_size,
+            "policy_delay": 1,
+            "l2_reg": 0.0,
+            "non_stationary_adam": False,
+            "policy_noise": 0.0,
+            "noise_clip": 0.0,
+            "max_grad_norm": self.max_grad_norm,
+        }
+
+    @staticmethod
+    def _grad_norm(parameters):
+        squared_norm = 0.0
+        has_grad = False
+        for parameter in parameters:
+            if parameter.grad is None:
+                continue
+            has_grad = True
+            grad_norm = parameter.grad.detach().data.norm(2).item()
+            squared_norm += grad_norm ** 2
+        if not has_grad:
+            return None
+        return squared_norm ** 0.5
 
     def _require_supported_configuration(self):
         if self.flags.get("full_observable_critic"):
@@ -115,6 +145,8 @@ class FMIDDPGTrainer(BaseTrainer):
         radar_tensor = torch.tensor(np.stack(obs[2]), dtype=self.torch_dtype, device=self.device)
 
         actions = []
+        raw_actions = []
+        noise_samples = []
         with torch.no_grad():
             for i in range(self.n_agents):
                 action, _ = self.actor(
@@ -125,10 +157,34 @@ class FMIDDPGTrainer(BaseTrainer):
                     ]
                 )
                 action = action.cpu().numpy()[0]
+                raw_action = action.copy()
+                noise = np.zeros(self.action_dim, dtype=self.numpy_dtype)
                 if not evaluate:
-                    action += np.random.normal(0, self._noise_scale(), size=self.action_dim).astype(self.numpy_dtype)
-                actions.append(np.clip(action, -1.0, 1.0).astype(self.numpy_dtype))
+                    noise = np.random.normal(0, self._noise_scale(), size=self.action_dim).astype(self.numpy_dtype)
+                    action += noise
+                clipped_action = np.clip(action, -1.0, 1.0).astype(self.numpy_dtype)
+                raw_actions.append(raw_action.astype(self.numpy_dtype))
+                noise_samples.append(noise)
+                actions.append(clipped_action)
 
+        raw_actions_arr = np.asarray(raw_actions, dtype=self.numpy_dtype)
+        noise_arr = np.asarray(noise_samples, dtype=self.numpy_dtype)
+        actions_arr = np.asarray(actions, dtype=self.numpy_dtype)
+        self.last_action_info = {
+            "raw_mean": float(np.mean(raw_actions_arr)),
+            "raw_std": float(np.std(raw_actions_arr)),
+            "raw_min": float(np.min(raw_actions_arr)),
+            "raw_max": float(np.max(raw_actions_arr)),
+            "noise_scale": float(0.0 if evaluate else self._noise_scale()),
+            "sampled_noise_mean": float(np.mean(noise_arr)),
+            "sampled_noise_std": float(np.std(noise_arr)),
+            "final_mean": float(np.mean(actions_arr)),
+            "final_std": float(np.std(actions_arr)),
+            "final_min": float(np.min(actions_arr)),
+            "final_max": float(np.max(actions_arr)),
+            "final_abs_mean": float(np.mean(np.abs(actions_arr))),
+            "clip_rate": float(np.mean(np.isclose(np.abs(actions_arr), 1.0, atol=1e-6))),
+        }
         self.action_step += 1
         return actions
 
@@ -199,6 +255,20 @@ class FMIDDPGTrainer(BaseTrainer):
             return None
         if single_eps_critic_cal_record is None:
             single_eps_critic_cal_record = []
+        self.last_update_info = {
+            "update_performed": False,
+            "actor_updated": False,
+            "update_step": int(i_episode if i_episode is not None else self.current_episode),
+            "buffer_size": len(self.buffer),
+            "learning_starts": self.batch_size,
+            "batch_size": self.batch_size,
+            "policy_delay": 1,
+            "l2_reg": 0.0,
+            "non_stationary_adam": False,
+            "policy_noise": 0.0,
+            "noise_clip": 0.0,
+            "max_grad_norm": self.max_grad_norm,
+        }
         if len(self.buffer) <= self.batch_size:
             return None, None, single_eps_critic_cal_record
 
@@ -274,6 +344,9 @@ class FMIDDPGTrainer(BaseTrainer):
 
         self.critic_optimizer.zero_grad()
         loss_Q.backward()
+        critic_grad_norm = self._grad_norm(self.critic.parameters())
+        if self.max_grad_norm > 0:
+            torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
         self.critic_optimizer.step()
 
         action_i, _ = self.actor([stacked_elem_0, stacked_elem_1, stacked_elem_2])
@@ -295,11 +368,22 @@ class FMIDDPGTrainer(BaseTrainer):
             if i_episode > 10000:
                 self.actor_optimizer.zero_grad()
                 actor_loss.backward()
+                actor_grad_norm = self._grad_norm(self.actor.parameters())
+                if self.max_grad_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
                 self.actor_optimizer.step()
+                actor_updated = True
+            else:
+                actor_grad_norm = None
+                actor_updated = False
         else:
             self.actor_optimizer.zero_grad()
             actor_loss.backward()
+            actor_grad_norm = self._grad_norm(self.actor.parameters())
+            if self.max_grad_norm > 0:
+                torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
             self.actor_optimizer.step()
+            actor_updated = True
 
         c_loss.append(loss_Q)
         a_loss.append(actor_loss)
@@ -308,6 +392,34 @@ class FMIDDPGTrainer(BaseTrainer):
             soft_update(self.critic_target, self.critic, self.tau)
             soft_update(self.actor_target, self.actor, self.tau)
 
+        self.last_update_info = {
+            "update_performed": True,
+            "actor_updated": actor_updated,
+            "update_step": int(i_episode),
+            "buffer_size": len(self.buffer),
+            "learning_starts": self.batch_size,
+            "batch_size": self.batch_size,
+            "policy_delay": 1,
+            "l2_reg": 0.0,
+            "non_stationary_adam": False,
+            "policy_noise": 0.0,
+            "noise_clip": 0.0,
+            "max_grad_norm": self.max_grad_norm,
+            "critic_loss": float(loss_Q.detach().cpu().item()),
+            "actor_loss": float(actor_loss.detach().cpu().item()),
+            "q1_mean": float(current_Q.detach().mean().cpu().item()),
+            "q2_mean": None,
+            "target_q1_mean": float(next_target_critic_value.detach().mean().cpu().item()),
+            "target_q2_mean": None,
+            "target_min_q_mean": float(next_target_critic_value.detach().mean().cpu().item()),
+            "target_y_mean": float(target_Q.detach().mean().cpu().item()),
+            "reward_batch_mean": float(reward_batch.detach().mean().cpu().item()),
+            "done_batch_mean": float(dones_stacked.detach().mean().cpu().item()),
+            "target_twin_gap_abs_mean": None,
+            "critic1_grad_norm": critic_grad_norm,
+            "critic2_grad_norm": None,
+            "actor_grad_norm": actor_grad_norm,
+        }
         return c_loss, a_loss, single_eps_critic_cal_record
 
     def save(self, path, episode=None, step=None, stop_mode=None):

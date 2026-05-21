@@ -21,6 +21,21 @@ class ORCATrainer(BaseTrainer):
         self._vector_cls = None
         self._simulator = None
         self._simulator_env_id = None
+        self.last_action_info = {}
+        self.last_update_info = {
+            "update_performed": False,
+            "actor_updated": False,
+            "update_step": 0,
+            "buffer_size": 0,
+            "learning_starts": 0,
+            "batch_size": 0,
+            "policy_delay": 1,
+            "l2_reg": 0.0,
+            "non_stationary_adam": False,
+            "policy_noise": 0.0,
+            "noise_clip": 0.0,
+            "max_grad_norm": 0.0,
+        }
 
     def _ensure_backend_loaded(self):
         if self._simulator_cls is not None and self._vector_cls is not None:
@@ -113,6 +128,22 @@ class ORCATrainer(BaseTrainer):
             accel = (desired_velocity - current_velocity) / float(env.time_step)
             normalized_action = np.clip(accel / float(env.acc_max), -1.0, 1.0)
             actions.append(normalized_action)
+        actions_arr = np.asarray(actions, dtype=np.float64)
+        self.last_action_info = {
+            "raw_mean": float(np.mean(actions_arr)),
+            "raw_std": float(np.std(actions_arr)),
+            "raw_min": float(np.min(actions_arr)),
+            "raw_max": float(np.max(actions_arr)),
+            "noise_scale": 0.0,
+            "sampled_noise_mean": 0.0,
+            "sampled_noise_std": 0.0,
+            "final_mean": float(np.mean(actions_arr)),
+            "final_std": float(np.std(actions_arr)),
+            "final_min": float(np.min(actions_arr)),
+            "final_max": float(np.max(actions_arr)),
+            "final_abs_mean": float(np.mean(np.abs(actions_arr))),
+            "clip_rate": float(np.mean(np.isclose(np.abs(actions_arr), 1.0, atol=1e-6))),
+        }
         return actions
 
     def select_action(self, obs, evaluate=False):
