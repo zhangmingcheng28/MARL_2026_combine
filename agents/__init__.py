@@ -2,6 +2,7 @@ from agents.fm_iddpg.trainer import FMIDDPGTrainer
 from agents.iddpg.trainer import IDDPGTrainer
 from agents.maac.trainer import MAACTrainer
 from agents.maddpg.trainer import MADDPGTrainer
+from agents.mappo.trainer import MAPPOTrainer
 from agents.matd3.trainer import MATD3Trainer
 from agents.orca.trainer import ORCATrainer
 
@@ -15,6 +16,8 @@ def build_trainer(args):
         return FMIDDPGTrainer(args)
     elif algo in ("maddpg", "maddpg-critic-attention"):
         return MADDPGTrainer(args)
+    elif algo == "mappo":
+        return MAPPOTrainer(args)
     elif algo == "maac":
         return MAACTrainer(args)
     elif algo in ("matd3", "matd3-critic-attention"):
