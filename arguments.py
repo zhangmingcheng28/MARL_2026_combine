@@ -8,16 +8,16 @@ DEFAULT_CONFIG = {
     "seed": 777,
     "device": "auto",
     "dtype": "float32",
-    "mode": "evaluate",  # or evaluate
-    "algorithm": "matd3",  # or maddpg, maddpg-critic-attention, maac, matd3, matd3-critic-attention, iddpg, fm-iddpg, orca
+    "mode": "train",  # or evaluate
+    "algorithm": "matd3",  # or maddpg, maddpg-critic-attention, mappo, maac, matd3, matd3-critic-attention, iddpg, fm-iddpg, orca
     "exp_name": "default_exp",
     "save_interval": 5000,
     "paths": {
         "project_root": str(PROJECT_ROOT),
         "resource_env_var": DEFAULT_RESOURCE_ENV_VAR,
         "checkpoint_dir": "checkpoints",
-        "checkpoint_run": "190526_09_31_31",  # this is for evaluation
-        # "checkpoint_run": None,  # this is also used for training folder saving; training uses None
+        #"checkpoint_run": "190526_09_31_31",  # this is for evaluation
+        "checkpoint_run": None,  # this is also used for training folder saving; training uses None
         "checkpoint_kind": "step",  # ep
         "checkpoint_value": 450000,
         "resource_file": None,
@@ -39,8 +39,11 @@ DEFAULT_CONFIG = {
         "grid_length": 10,
         "acc_max": 8,
         "max_speed": 5,
-        "random_map_idx": [0, 2, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14],
+        "random_map_idx": [3],
         "neighbour_search_distance": 100000,
+        # "path_planner": "cbs",
+        "path_planner": "astar",
+        "planner_fallback": "jps",
         "full_observable_critic": False,
         "evaluation_by_episode": False,
     },
@@ -60,8 +63,14 @@ DEFAULT_CONFIG = {
         "learning_starts": 1000,
         "max_grad_norm": 0.0,
         "feature_matching_lambda": 0.002,
-        "matd3_l2_reg": 0.0,
-        "matd3_non_stationary_adam": False,
+        "mappo_rollout_size": 512,
+        "mappo_ppo_epochs": 4,
+        "mappo_clip_ratio": 0.2,
+        "mappo_gae_lambda": 0.95,
+        "mappo_value_coef": 0.5,
+        "mappo_entropy_coef": 0.01,
+        "matd3_l2_reg": 5e-5,
+        "matd3_non_stationary_adam": True,
         "policy_noise": 0,
         "noise_clip": 0,
         "policy_delay": 1,
@@ -87,6 +96,7 @@ DEFAULT_CONFIG = {
         "use_all_neigh_with_radar": True,  # for iddpg only, keep it, otherwise training will fail
         "use_critic_attention": False,
         "use_dec_reward": False,
+        "use_path_following_reward": False,
         "include_building_in_overall_conflict": True,
         "own_obs_only": False,
     },
@@ -132,7 +142,7 @@ def get_args():
         "--algo",
         type=str,
         default=DEFAULT_CONFIG["algorithm"],
-        choices=["iddpg", "fm-iddpg", "maddpg", "maddpg-critic-attention", "maac", "matd3", "matd3-critic-attention", "orca"],
+        choices=["iddpg", "fm-iddpg", "maddpg", "maddpg-critic-attention", "mappo", "maac", "matd3", "matd3-critic-attention", "orca"],
     )
     parser.add_argument("--exp_name", type=str, default=DEFAULT_CONFIG["exp_name"])
 
@@ -151,6 +161,8 @@ def get_args():
         type=_parse_random_map_idx,
         default=list(DEFAULT_CONFIG["env"]["random_map_idx"]),
     )
+    parser.add_argument("--path_planner", type=str, default=DEFAULT_CONFIG["env"]["path_planner"])
+    parser.add_argument("--planner_fallback", type=str, default=DEFAULT_CONFIG["env"]["planner_fallback"])
     parser.add_argument("--acc_max", type=float, default=DEFAULT_CONFIG["env"]["acc_max"])
     parser.add_argument("--max_speed", type=float, default=DEFAULT_CONFIG["env"]["max_speed"])
 
@@ -179,6 +191,12 @@ def get_args():
         type=float,
         default=DEFAULT_CONFIG["train"]["feature_matching_lambda"],
     )
+    parser.add_argument("--mappo_rollout_size", type=int, default=DEFAULT_CONFIG["train"]["mappo_rollout_size"])
+    parser.add_argument("--mappo_ppo_epochs", type=int, default=DEFAULT_CONFIG["train"]["mappo_ppo_epochs"])
+    parser.add_argument("--mappo_clip_ratio", type=float, default=DEFAULT_CONFIG["train"]["mappo_clip_ratio"])
+    parser.add_argument("--mappo_gae_lambda", type=float, default=DEFAULT_CONFIG["train"]["mappo_gae_lambda"])
+    parser.add_argument("--mappo_value_coef", type=float, default=DEFAULT_CONFIG["train"]["mappo_value_coef"])
+    parser.add_argument("--mappo_entropy_coef", type=float, default=DEFAULT_CONFIG["train"]["mappo_entropy_coef"])
     parser.add_argument("--matd3_l2_reg", type=float, default=DEFAULT_CONFIG["train"]["matd3_l2_reg"])
     parser.add_argument(
         "--matd3_non_stationary_adam",
@@ -208,6 +226,11 @@ def get_args():
     parser.add_argument("--use_all_neigh_with_radar", action="store_true", default=DEFAULT_CONFIG["flags"]["use_all_neigh_with_radar"])
     parser.add_argument("--use_critic_attention", action="store_true", default=DEFAULT_CONFIG["flags"]["use_critic_attention"])
     parser.add_argument("--use_dec_reward", action="store_true", default=DEFAULT_CONFIG["flags"]["use_dec_reward"])
+    parser.add_argument(
+        "--use_path_following_reward",
+        action="store_true",
+        default=DEFAULT_CONFIG["flags"]["use_path_following_reward"],
+    )
     parser.add_argument(
         "--include_building_in_overall_conflict",
         action="store_true",
@@ -269,6 +292,8 @@ def build_config(args):
     config["env"]["grid_obs_shape"] = list(args.grid_obs_shape)
     config["env"]["bound"] = list(args.bound)
     config["env"]["random_map_idx"] = _parse_random_map_idx(args.random_map_idx)
+    config["env"]["path_planner"] = str(args.path_planner).lower()
+    config["env"]["planner_fallback"] = str(args.planner_fallback)
     config["env"]["acc_max"] = args.acc_max
     config["env"]["max_speed"] = args.max_speed
     config["env"]["resource_file"] = config["paths"]["resource_file"]
@@ -288,6 +313,12 @@ def build_config(args):
     config["train"]["learning_starts"] = args.learning_starts
     config["train"]["max_grad_norm"] = args.max_grad_norm
     config["train"]["feature_matching_lambda"] = args.feature_matching_lambda
+    config["train"]["mappo_rollout_size"] = max(1, int(args.mappo_rollout_size))
+    config["train"]["mappo_ppo_epochs"] = max(1, int(args.mappo_ppo_epochs))
+    config["train"]["mappo_clip_ratio"] = float(args.mappo_clip_ratio)
+    config["train"]["mappo_gae_lambda"] = float(args.mappo_gae_lambda)
+    config["train"]["mappo_value_coef"] = float(args.mappo_value_coef)
+    config["train"]["mappo_entropy_coef"] = float(args.mappo_entropy_coef)
     config["train"]["matd3_l2_reg"] = args.matd3_l2_reg
     config["train"]["matd3_non_stationary_adam"] = args.matd3_non_stationary_adam
     config["train"]["policy_noise"] = args.policy_noise
@@ -316,6 +347,7 @@ def build_config(args):
         "matd3-critic-attention",
     )
     config["flags"]["use_dec_reward"] = args.use_dec_reward
+    config["flags"]["use_path_following_reward"] = args.use_path_following_reward
     config["flags"]["include_building_in_overall_conflict"] = args.include_building_in_overall_conflict
     config["flags"]["own_obs_only"] = args.own_obs_only
 
