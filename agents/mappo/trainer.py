@@ -44,6 +44,7 @@ class MAPPOTrainer(BaseTrainer):
         self.rollout_size = int(config["train"].get("mappo_rollout_size", self.batch_size))
         self.ppo_epochs = int(config["train"].get("mappo_ppo_epochs", 4))
         self.clip_ratio = float(config["train"].get("mappo_clip_ratio", 0.2))
+        self.gae_lambda = float(config["train"].get("mappo_gae_lambda", 0.95))
         self.value_coef = float(config["train"].get("mappo_value_coef", 0.5))
         self.entropy_coef = float(config["train"].get("mappo_entropy_coef", 0.01))
         self.update_every = int(config["train"].get("update_every", 1))
@@ -71,6 +72,7 @@ class MAPPOTrainer(BaseTrainer):
             "buffer_size": 0,
             "learning_starts": self.rollout_size,
             "batch_size": self.batch_size,
+            "gae_lambda": self.gae_lambda,
             "policy_delay": 1,
             "l2_reg": 0.0,
             "non_stationary_adam": False,
@@ -289,6 +291,7 @@ class MAPPOTrainer(BaseTrainer):
             "buffer_size": len(self.buffer),
             "learning_starts": self.rollout_size,
             "batch_size": self.batch_size,
+            "gae_lambda": self.gae_lambda,
             "policy_delay": 1,
             "l2_reg": 0.0,
             "non_stationary_adam": False,
@@ -316,8 +319,14 @@ class MAPPOTrainer(BaseTrainer):
 
         with torch.no_grad():
             next_values_all = self._critic_values(next_obs_all)
-            returns_all = rewards_all + self.gamma * (1 - dones_all) * next_values_all
-            advantages_all = returns_all - old_values_all
+            deltas = rewards_all + self.gamma * (1 - dones_all) * next_values_all - old_values_all
+            advantages_all = torch.zeros_like(deltas)
+            gae_advantage = torch.zeros(self.n_agents, dtype=self.torch_dtype, device=self.device)
+            for step_idx in range(deltas.size(0) - 1, -1, -1):
+                mask = 1 - dones_all[step_idx]
+                gae_advantage = deltas[step_idx] + self.gamma * self.gae_lambda * mask * gae_advantage
+                advantages_all[step_idx] = gae_advantage
+            returns_all = advantages_all + old_values_all
             advantage_mean = advantages_all.mean()
             advantage_std = advantages_all.std(unbiased=False)
             if float(advantage_std.detach().cpu().item()) > 1e-8:
@@ -391,6 +400,7 @@ class MAPPOTrainer(BaseTrainer):
             "buffer_size": 0,
             "learning_starts": self.rollout_size,
             "batch_size": self.batch_size,
+            "gae_lambda": self.gae_lambda,
             "policy_delay": 1,
             "l2_reg": 0.0,
             "non_stationary_adam": False,

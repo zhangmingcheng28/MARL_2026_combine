@@ -16,6 +16,7 @@ import copy
 from copy import deepcopy
 from envs.uav import UAV
 from utils.jps_straight import jps_find_path
+from utils import shared_path_planner
 import warnings
 import os
 import pickle
@@ -80,6 +81,8 @@ class SharedMultiAgentEnv:
             flags: Optional[dict] = None,
             mode: str = "train",
             random_map_idx=3,
+            path_planner: str = "cbs",
+            planner_fallback: str = "astar,jps",
     ):
         self.n_agents = n_agents
         self.action_dim = action_dim
@@ -106,6 +109,8 @@ class SharedMultiAgentEnv:
         self.evaluation_by_episode = evaluation_by_episode
         self.flags = flags or {}
         self.mode = mode
+        self.path_planner = str(path_planner).lower()
+        self.planner_fallback = str(planner_fallback)
         self.nearest_neighbor_count = 0
         self.step_count = 0
         self.episode_count = 0
@@ -254,6 +259,8 @@ class SharedMultiAgentEnv:
             flags=deepcopy(config.get("flags", {})),
             mode=config.get("mode", "train"),
             random_map_idx=env_cfg.get("random_map_idx", 3),
+            path_planner=env_cfg.get("path_planner", "cbs"),
+            planner_fallback=env_cfg.get("planner_fallback", "astar,jps"),
         )
         env.nearest_neighbor_count = max(0, int(env_cfg.get("nearest_neighbor_count", 0)))
         if env.map_bundle_dir is not None:
@@ -266,6 +273,115 @@ class SharedMultiAgentEnv:
         env.create_world()
         env.search_distance = config["env"]["neighbour_search_distance"]
         return env
+
+    def _plan_single_route(self, planner_name, start_grid, goal_grid):
+        if planner_name == "astar":
+            return shared_path_planner.astar_path(self.world_map_2D_jps, start_grid, goal_grid)
+        if planner_name == "jps":
+            return jps_find_path(
+                (int(start_grid[0]), int(start_grid[1])),
+                (int(goal_grid[0]), int(goal_grid[1])),
+                self.world_map_2D_jps,
+            )
+        raise ValueError("Unsupported planner '{}'".format(planner_name))
+
+    def _grid_path_to_world_points(self, grid_path):
+        if self._using_precomputed_maps:
+            return [
+                [
+                    float(self.cropped_to_actual[(int(points[0]), int(points[1]))][0]),
+                    float(self.cropped_to_actual[(int(points[0]), int(points[1]))][1]),
+                ]
+                for points in grid_path
+            ]
+        return [
+            [
+                (points[0] + math.ceil(self.bound[0] / self.grid_length)) * self.grid_length,
+                (points[1] + math.ceil(self.bound[2] / self.grid_length)) * self.grid_length,
+            ]
+            for points in grid_path
+        ]
+
+    def _assign_uav_route(self, agent_idx, grid_path, planner_name):
+        agent = self.all_uavs[agent_idx]
+        refined_path = shared_path_planner.compress_path_turns(grid_path)
+        world_points = self._grid_path_to_world_points(refined_path)
+
+        agent.planned_path_grid = [tuple(point) for point in refined_path]
+        agent.planned_path_world = deepcopy(world_points)
+        agent.path_planner = planner_name
+        agent.goal = [
+            point for point in deepcopy(world_points)
+            if not np.array_equal(np.array(point), agent.ini_pos)
+        ]
+        if len(agent.goal) == 0:
+            agent.goal = [deepcopy(world_points[-1])]
+        agent.waypoints = deepcopy(agent.goal)
+        agent.ref_line = LineString(world_points)
+        agent.ref_line_segments = {}
+        for path_idx in range(len(agent.ref_line.coords) - 1):
+            start_point = agent.ref_line.coords[path_idx]
+            end_point = agent.ref_line.coords[path_idx + 1]
+            agent.ref_line_segments[(start_point, end_point)] = LineString([start_point, end_point])
+
+    def _plan_uav_routes_with_order(self, planning_requests, planner_order):
+        ordered_unique = []
+        for candidate in planner_order:
+            candidate_name = str(candidate).strip().lower()
+            if candidate_name and candidate_name not in ordered_unique:
+                ordered_unique.append(candidate_name)
+
+        planner_order = []
+        for candidate in ordered_unique:
+            if candidate not in planner_order:
+                planner_order.append(candidate)
+
+        starts = [request["start_grid"] for request in planning_requests]
+        goals = [request["goal_grid"] for request in planning_requests]
+        last_error = None
+
+        for candidate in planner_order:
+            if candidate == "cbs":
+                planned_paths = shared_path_planner.cbs_plan_paths(self.world_map_2D_jps, starts, goals)
+                if planned_paths:
+                    return {
+                        request["agent_idx"]: {
+                            "path": [tuple(node) for node in path],
+                            "planner": "cbs",
+                        }
+                        for request, path in zip(planning_requests, planned_paths)
+                    }
+                last_error = "CBS could not find a conflict-free solution."
+                continue
+
+            if candidate in ("astar", "jps"):
+                planned_routes = {}
+                failed = False
+                for request in planning_requests:
+                    route = self._plan_single_route(candidate, request["start_grid"], request["goal_grid"])
+                    if not route:
+                        last_error = "{} could not find a route for agent {}".format(
+                            candidate.upper(),
+                            request["agent_idx"],
+                        )
+                        failed = True
+                        break
+                    planned_routes[request["agent_idx"]] = {
+                        "path": [tuple(node) for node in route],
+                        "planner": candidate,
+                    }
+                if not failed:
+                    return planned_routes
+
+        raise ValueError(last_error or "No valid path could be generated for the current episode.")
+
+    def _plan_uav_routes(self, planning_requests):
+        planner_order = []
+        fallback_names = [name.strip().lower() for name in self.planner_fallback.split(",") if name.strip()]
+        for candidate in [self.path_planner] + fallback_names:
+            if candidate not in planner_order:
+                planner_order.append(candidate)
+        return self._plan_uav_routes_with_order(planning_requests, planner_order)
 
     def _derive_bounds_from_coord_mapping(self, coord_mapping):
         values = np.asarray(list(coord_mapping.values()), dtype=np.float64)
@@ -936,8 +1052,10 @@ class SharedMultiAgentEnv:
         agentsCoor_list = []  # for store all agents as circle polygon
         agentRefer_dict = {}  # A dictionary to use agent's current pos as key, their agent name (idx) as value
 
+        any_collision = 0
         start_pos_memory = []
         random_end_pos_collection = []
+        planning_requests = []
         # repeat simulation
         # with open(
         #         r'F:\githubClone\MARL_2nd_paper\80%_sortie_reach_change_map_HS\repeat_OD_for_orca_uav_5.pickle', 'rb') as handle:
@@ -1013,77 +1131,41 @@ class SharedMultiAgentEnv:
             # make sure we reset reach target
             self.all_uavs[agentIdx].reach_target = False
             self.all_uavs[agentIdx].collide_wall_count = 0
-
-            # large_start = [random_start_pos[0] / self.gridlength, random_start_pos[1] / self.gridlength]
-            # large_end = [random_end_pos[0] / self.gridlength, random_end_pos[1] / self.gridlength]
-            # small_area_map_start = [large_start[0] - math.ceil(self.bound[0] / self.gridlength),
-            #                         large_start[1] - math.ceil(self.bound[2] / self.gridlength)]
-            # small_area_map_end = [large_end[0] - math.ceil(self.bound[0] / self.gridlength),
-            #                       large_end[1] - math.ceil(self.bound[2] / self.gridlength)]
+            self.all_uavs[agentIdx].planned_path_grid = []
+            self.all_uavs[agentIdx].planned_path_world = []
+            self.all_uavs[agentIdx].path_planner = None
 
             small_area_map_s = self.centroid_to_position_empty[random_start_pos]
             small_area_map_e = self.centroid_to_position_empty[random_end_pos]
+            planning_requests.append(
+                {
+                    "agent_idx": agentIdx,
+                    "start_grid": tuple(small_area_map_s),
+                    "goal_grid": tuple(small_area_map_e),
+                }
+            )
 
-            width = self.world_map_2D.shape[0]
-            height = self.world_map_2D.shape[1]
+        planned_routes = self._plan_uav_routes(planning_requests)
+        comparison_routes = None
+        comparison_planner = None
+        if show:
+            fallback_names = [name.strip().lower() for name in self.planner_fallback.split(",") if name.strip()]
+            for candidate in fallback_names:
+                if candidate != self.path_planner:
+                    comparison_planner = candidate
+                    break
+            if comparison_planner is not None:
+                try:
+                    comparison_routes = self._plan_uav_routes_with_order(planning_requests, [comparison_planner])
+                except ValueError:
+                    comparison_routes = None
 
-            jps_map = self.world_map_2D_jps
-
-            outPath = jps_find_path((int(small_area_map_s[0]), int(small_area_map_s[1])),
-                                    (int(small_area_map_e[0]), int(small_area_map_e[1])), jps_map)
-
-            # outPath = jps.find_path(small_area_map_s, small_area_map_e, width, height, jps_map)[0]
-
-            refinedPath = []
-            curHeading = math.atan2((outPath[1][1] - outPath[0][1]),
-                                    (outPath[1][0] - outPath[0][0]))
-            refinedPath.append(outPath[0])
-            for id_ in range(2, len(outPath)):
-                nextHeading = math.atan2((outPath[id_][1] - outPath[id_ - 1][1]),
-                                         (outPath[id_][0] - outPath[id_ - 1][0]))
-                if curHeading != nextHeading:  # add the "id_-1" th element
-                    refinedPath.append(outPath[id_ - 1])
-                    curHeading = nextHeading  # update the current heading
-            refinedPath.append(outPath[-1])
-
-            if self._using_precomputed_maps:
-                goal_points = [
-                    [
-                        float(self.cropped_to_actual[(int(points[0]), int(points[1]))][0]),
-                        float(self.cropped_to_actual[(int(points[0]), int(points[1]))][1]),
-                    ]
-                    for points in refinedPath
-                ]
-            else:
-                goal_points = [
-                    [
-                        (points[0] + math.ceil(self.bound[0] / self.grid_length)) * self.grid_length,
-                        (points[1] + math.ceil(self.bound[2] / self.grid_length)) * self.grid_length,
-                    ]
-                    for points in refinedPath
-                ]
-
-            # load the to goal, but remove/exclude the 1st point, which is the initial position
-            self.all_uavs[agentIdx].goal = [
-                point for point in goal_points
-                if not np.array_equal(np.array(point), self.all_uavs[agentIdx].ini_pos)
-            ]  # if not np.array_equal(np.array(points), self.all_agents[agentIdx].ini_pos)
-
-            self.all_uavs[agentIdx].waypoints = deepcopy(self.all_uavs[agentIdx].goal)
-
-            # load the to goal but we include the initial position
-            goalPt_withini = goal_points
-
-            self.all_uavs[agentIdx].ref_line = LineString(goalPt_withini)
-            # ---------------- end of using random initialized agent position for traffic flow ---------
-
-            self.all_uavs[agentIdx].ref_line_segments = {}
-            # Iterate over line coordinates and create line segments
-            for i in range(len(self.all_uavs[agentIdx].ref_line.coords) - 1):
-                start_point = self.all_uavs[agentIdx].ref_line.coords[i]
-                end_point = self.all_uavs[agentIdx].ref_line.coords[i + 1]
-                segment = LineString([start_point, end_point])
-                self.all_uavs[agentIdx].ref_line_segments[(start_point, end_point)] = segment
+        for agentIdx in self.all_uavs.keys():
+            self._assign_uav_route(
+                agentIdx,
+                planned_routes[agentIdx]["path"],
+                planned_routes[agentIdx]["planner"],
+            )
 
             # heading in rad, must be goal_pos-intruder_pos, and y2-y1, x2-x1
             # this is the initialized heading.
@@ -1164,14 +1246,60 @@ class SharedMultiAgentEnv:
                 # ax.add_patch(detec_circle_mat)
                 self._draw_destination_marker(ax, agent.goal[-1], agentIdx)
 
-                # # link individual drone's starting position with its goal
-                # ini = agent.ini_pos
-                # for wp in agent.goal:
-                #     plt.plot(wp[0], wp[1], marker='*', color='y', markersize=10)
-                #     plt.plot([wp[0], ini[0]], [wp[1], ini[1]], '--', color='c')
-                #     ini = wp
-                # plt.plot(agent.goal[-1][0], agent.goal[-1][1], marker='*', color='y', markersize=10)
-                # plt.text(agent.goal[-1][0], agent.goal[-1][1], agent.agent_name)
+                route_points = agent.planned_path_world if agent.planned_path_world else [agent.ini_pos.tolist()] + list(agent.goal)
+                if len(route_points) >= 2:
+                    route_x = [point[0] for point in route_points]
+                    route_y = [point[1] for point in route_points]
+                    ax.plot(
+                        route_x,
+                        route_y,
+                        linestyle='--',
+                        linewidth=1.2,
+                        color='#00bcd4',
+                        alpha=0.95,
+                        zorder=2.8,
+                    )
+                for waypoint in route_points[1:-1]:
+                    ax.plot(
+                        waypoint[0],
+                        waypoint[1],
+                        marker='o',
+                        color='#26c6da',
+                        markersize=3,
+                        zorder=3.1,
+                    )
+                planner_label = "{}".format(getattr(agent, "path_planner", self.path_planner).upper())
+                planner_text = plt.text(
+                    agent.pos[0],
+                    agent.pos[1] + 5,
+                    planner_label,
+                    ha='center',
+                    va='center',
+                    color='#00bcd4',
+                    fontsize=5,
+                    zorder=3.3,
+                )
+                planner_text.set_path_effects([patheffects.withStroke(linewidth=1.6, foreground='black')])
+
+                if comparison_routes is not None and agentIdx in comparison_routes:
+                    primary_cells = set(tuple(point) for point in getattr(agent, "planned_path_grid", []))
+                    comparison_cells = set(tuple(point) for point in comparison_routes[agentIdx]["path"])
+                    intersection_count = len(primary_cells.intersection(comparison_cells))
+                    comparison_label = "{} int={}".format(
+                        comparison_routes[agentIdx]["planner"].upper(),
+                        intersection_count,
+                    )
+                    comparison_text = plt.text(
+                        agent.pos[0],
+                        agent.pos[1] + 10,
+                        comparison_label,
+                        ha='center',
+                        va='center',
+                        color='#ffd54f',
+                        fontsize=5,
+                        zorder=3.3,
+                    )
+                    comparison_text.set_path_effects([patheffects.withStroke(linewidth=1.6, foreground='black')])
 
             # draw occupied_poly
             occupied_texture_drawn = self._draw_occupied_poly_texture(ax)
@@ -2444,6 +2572,33 @@ class SharedMultiAgentEnv:
             next_wp = np.array(drone_obj.waypoints[0])
             wp_intersect_flag = cur_dist_to_wp < wp_reach_threshold_dist
 
+            host_drone_detection_circle = Point(drone_obj.pos[0], drone_obj.pos[1]).buffer(
+                drone_obj.detectionRange / 2,
+                cap_style='round',
+            )
+            intersection_points = host_drone_detection_circle.boundary.intersection(drone_obj.ref_line)
+            if intersection_points.is_empty:
+                detection_circle_refLine_intersect = None
+            elif intersection_points.geom_type == 'MultiPoint':
+                end_point = Point(drone_obj.ref_line.coords[-1])
+                detection_circle_refLine_intersect = min(
+                    intersection_points.geoms,
+                    key=lambda point: point.distance(end_point),
+                )
+            elif intersection_points.geom_type == 'Point':
+                detection_circle_refLine_intersect = intersection_points
+            else:
+                candidate_points = []
+                if hasattr(intersection_points, "geoms"):
+                    for geom in intersection_points.geoms:
+                        if geom.geom_type == 'Point':
+                            candidate_points.append(geom)
+                        elif geom.geom_type in ('LineString', 'LinearRing'):
+                            candidate_points.append(Point(geom.coords[-1]))
+                detection_circle_refLine_intersect = candidate_points[0] if candidate_points else None
+            if np.linalg.norm(drone_obj.pos - drone_obj.goal[-1]) <= drone_obj.detectionRange / 2:
+                detection_circle_refLine_intersect = Point(drone_obj.goal[-1])
+
             rew = 0
             dist_to_goal_coeff = 6
             x_norm, y_norm = self.normalizer.nmlz_pos(drone_obj.pos)
@@ -2461,11 +2616,40 @@ class SharedMultiAgentEnv:
             norm_cross_track_deviation_x = x_error * self.normalizer.x_scale
             norm_cross_track_deviation_y = y_error * self.normalizer.y_scale
 
-            if cross_err_distance <= drone_obj.protectiveBound:
-                m = (0 - 1) / (drone_obj.protectiveBound - 0)
-                dist_to_ref_line = coef_ref_line * (m * cross_err_distance + 1)
+            if self.flags.get("use_path_following_reward", False):
+                coef_ref_line = 1.0
+                if detection_circle_refLine_intersect is not None:
+                    poi = np.array(
+                        [detection_circle_refLine_intersect.x, detection_circle_refLine_intersect.y],
+                        dtype=np.float64,
+                    )
+                    tangent_delta = poi - drone_obj.pos
+                    tangent_norm = np.linalg.norm(tangent_delta)
+                    if tangent_norm == 0 or not np.isfinite(tangent_norm):
+                        dist_to_ref_line = -1.0
+                    else:
+                        tangent_vector = tangent_delta / tangent_norm
+                        if not np.all(np.isfinite(drone_obj.vel)):
+                            vel_unit_vector = np.zeros_like(drone_obj.vel)
+                        else:
+                            velocity_norm = np.linalg.norm(drone_obj.vel)
+                            if velocity_norm == 0 or not np.isfinite(velocity_norm):
+                                vel_unit_vector = np.zeros_like(drone_obj.vel)
+                            else:
+                                vel_unit_vector = drone_obj.vel / velocity_norm
+                        direction_reward = float(np.dot(vel_unit_vector, tangent_vector))
+                        if direction_reward == 0:
+                            dist_to_ref_line = -1.0
+                        else:
+                            dist_to_ref_line = coef_ref_line * direction_reward
+                else:
+                    dist_to_ref_line = -1.0
             else:
-                dist_to_ref_line = -coef_ref_line * 1
+                if cross_err_distance <= drone_obj.protectiveBound:
+                    m = (0 - 1) / (drone_obj.protectiveBound - 0)
+                    dist_to_ref_line = coef_ref_line * (m * cross_err_distance + 1)
+                else:
+                    dist_to_ref_line = -coef_ref_line * 1
 
             surrounding_collision_penalty = 0
 
@@ -2616,6 +2800,372 @@ class SharedMultiAgentEnv:
         if goal_state_mismatch:
             raise ValueError(
                 "ss_reward_Mar goal-state mismatch detected. check_goal={} reach_target={} details={}".format(
+                    check_goal,
+                    reach_target_state,
+                    goal_state_mismatch,
+                )
+            )
+
+        if full_observable_critic_flag:
+            reward = [np.sum(reward) for _ in reward]
+
+        return reward, done, check_goal, step_reward_record, eps_status_holder, step_collision_record, bound_building_check
+
+    def ss_reward_2026(
+            self,
+            current_ts,
+            step_reward_record,
+            step_collision_record,
+            xy,
+            full_observable_critic_flag,
+            args,
+            evaluation_by_episode,
+    ):
+        bound_building_check = [False] * 4
+        eps_status_holder = [{} for _ in range(len(self.all_uavs))]
+        reward, done = [], []
+        agent_to_remove = []
+        check_goal = [False] * len(self.all_uavs)
+
+        crash_penalty_wall = 20
+        x_left_bound = LineString([(self.bound[0], -9999), (self.bound[0], 9999)])
+        x_right_bound = LineString([(self.bound[1], -9999), (self.bound[1], 9999)])
+        y_bottom_bound = LineString([(-9999, self.bound[2]), (9999, self.bound[2])])
+        y_top_bound = LineString([(-9999, self.bound[3]), (9999, self.bound[3])])
+
+        for drone_idx, drone_obj in self.all_uavs.items():
+            if xy[0] is not None and xy[1] is not None and drone_idx > 0:
+                continue
+            if xy[0] is not None and xy[1] is not None:
+                drone_obj.pos = np.array([xy[0], xy[1]])
+                drone_obj.pre_pos = drone_obj.pos
+
+            reached_before_step = drone_obj.reach_target
+
+            collision_drones = []
+            collide_building = 0
+
+            curPoint = Point(drone_obj.pos)
+            host_pass_line = LineString([drone_obj.pre_pos, drone_obj.pos])
+            host_passed_volume = host_pass_line.buffer(drone_obj.protectiveBound, cap_style='round')
+            host_current_circle = Point(drone_obj.pos[0], drone_obj.pos[1]).buffer(drone_obj.protectiveBound)
+            host_current_point = Point(drone_obj.pos[0], drone_obj.pos[1])
+
+            nearest_neigh_key = None
+            immediate_tcpa = math.inf
+            shortest_neigh_dist = math.inf
+            all_neigh_dist = []
+            neigh_relative_bearing = None
+            neigh_collision_bearing = None
+            for neigh_keys in drone_obj.surroundingNeighbor:
+                tcpa, d_tcpa, _ = compute_t_cpa_d_cpa_potential_col(
+                    self.all_uavs[neigh_keys].pos, drone_obj.pos, self.all_uavs[neigh_keys].vel, drone_obj.vel,
+                    self.all_uavs[neigh_keys].protectiveBound, drone_obj.protectiveBound, 0)
+
+                cur_nei_circle = Point(self.all_uavs[neigh_keys].pos[0],
+                                       self.all_uavs[neigh_keys].pos[1]).buffer(
+                    self.all_uavs[neigh_keys].protectiveBound)
+                cur_nei_tar_circle = Point(self.all_uavs[neigh_keys].goal[-1]).buffer(1, cap_style='round')
+                with warnings.catch_warnings():
+                    warnings.simplefilter('ignore', category=RuntimeWarning)
+                    neigh_goal_intersect = cur_nei_circle.intersection(cur_nei_tar_circle)
+                if args.mode == 'eval' and evaluation_by_episode is False:
+                    if not neigh_goal_intersect.is_empty:
+                        continue
+
+                diff_dist_vec = drone_obj.pos - self.all_uavs[neigh_keys].pos
+                euclidean_dist_diff = np.linalg.norm(diff_dist_vec)
+
+                if self.all_uavs[neigh_keys].reach_target or reached_before_step:
+                    euclidean_dist_diff = math.inf
+                else:
+                    all_neigh_dist.append(euclidean_dist_diff)
+
+                if tcpa >= 0 and tcpa < immediate_tcpa:
+                    immediate_tcpa = tcpa
+
+                if euclidean_dist_diff < shortest_neigh_dist:
+                    shortest_neigh_dist = euclidean_dist_diff
+                    neigh_relative_bearing = calculate_bearing(
+                        drone_obj.pos[0], drone_obj.pos[1],
+                        self.all_uavs[neigh_keys].pos[0], self.all_uavs[neigh_keys].pos[1],
+                    )
+                    nearest_neigh_key = neigh_keys
+                if np.linalg.norm(diff_dist_vec) <= drone_obj.protectiveBound * 2:
+                    if args.mode == 'eval' and evaluation_by_episode is False:
+                        neigh_collision_bearing = calculate_bearing(
+                            drone_obj.pos[0], drone_obj.pos[1],
+                            self.all_uavs[neigh_keys].pos[0], self.all_uavs[neigh_keys].pos[1],
+                        )
+                        if self.all_uavs[neigh_keys].drone_collision \
+                                or self.all_uavs[neigh_keys].building_collision \
+                                or self.all_uavs[neigh_keys].reach_target \
+                                or reached_before_step \
+                                or drone_obj.building_collision \
+                                or drone_obj.drone_collision \
+                                or self.all_uavs[neigh_keys].bound_collision:
+                            continue
+                        collision_drones.append(neigh_keys)
+                        drone_obj.drone_collision = True
+                        self.all_uavs[neigh_keys].drone_collision = True
+                    else:
+                        if self.all_uavs[neigh_keys].reach_target or reached_before_step:
+                            pass
+                        else:
+                            neigh_collision_bearing = calculate_bearing(
+                                drone_obj.pos[0], drone_obj.pos[1],
+                                self.all_uavs[neigh_keys].pos[0], self.all_uavs[neigh_keys].pos[1],
+                            )
+                            collision_drones.append(neigh_keys)
+                            drone_obj.drone_collision = True
+
+            flag_previous_nearest_two = 0
+            neigh_count = 0
+            for neigh_keys in drone_obj.pre_surroundingNeighbor:
+                for collided_drone_keys in collision_drones:
+                    if collided_drone_keys == neigh_keys:
+                        flag_previous_nearest_two = 1
+                        break
+                neigh_count += 1
+                if neigh_count > 1:
+                    break
+
+            start_of_v1_time = time.time()
+            v1_decision = 0
+            if not reached_before_step:
+                possiblePoly = self.all_buildingSTR.query(host_current_circle)
+                for element in possiblePoly:
+                    if self.all_buildingSTR.geometries.take(element).intersection(host_current_circle):
+                        collide_building = 1
+                        v1_decision = collide_building
+                        drone_obj.collide_wall_count += 1
+                        drone_obj.building_collision = True
+                        break
+            end_v1_time = (time.time() - start_of_v1_time) * 1000 * 1000
+
+            end_v2_time, end_v3_time, v2_decision, v3_decision = 0, 0, 0, 0
+            step_collision_record[drone_idx].append([end_v1_time, end_v2_time, end_v3_time,
+                                                     v1_decision, v2_decision, v3_decision])
+
+            tar_circle = Point(drone_obj.goal[-1]).buffer(1, cap_style='round')
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore', category=RuntimeWarning)
+                goal_cur_intru_intersect = host_current_circle.intersection(tar_circle)
+
+            wp_reach_threshold_dist = 5
+            cur_dist_to_wp = curPoint.distance(Point(drone_obj.waypoints[0]))
+            wp_intersect_flag = cur_dist_to_wp < wp_reach_threshold_dist
+
+            host_drone_detection_circle = Point(drone_obj.pos[0], drone_obj.pos[1]).buffer(
+                drone_obj.detectionRange / 2,
+                cap_style='round',
+            )
+            intersection_points = host_drone_detection_circle.boundary.intersection(drone_obj.ref_line)
+            if intersection_points.is_empty:
+                detection_circle_refLine_intersect = None
+            elif intersection_points.geom_type == 'MultiPoint':
+                end_point = Point(drone_obj.ref_line.coords[-1])
+                detection_circle_refLine_intersect = min(
+                    intersection_points.geoms,
+                    key=lambda point: point.distance(end_point),
+                )
+            elif intersection_points.geom_type == 'Point':
+                detection_circle_refLine_intersect = intersection_points
+            else:
+                candidate_points = []
+                if hasattr(intersection_points, "geoms"):
+                    for geom in intersection_points.geoms:
+                        if geom.geom_type == 'Point':
+                            candidate_points.append(geom)
+                        elif geom.geom_type in ('LineString', 'LinearRing'):
+                            candidate_points.append(Point(geom.coords[-1]))
+                detection_circle_refLine_intersect = candidate_points[0] if candidate_points else None
+            if np.linalg.norm(drone_obj.pos - drone_obj.goal[-1]) <= drone_obj.detectionRange / 2:
+                detection_circle_refLine_intersect = Point(drone_obj.goal[-1])
+
+            rew = 0.0
+            dist_to_goal_coeff = 6.0
+            after_dist_hg = np.linalg.norm(drone_obj.pos - drone_obj.goal[-1])
+            dist_left = max(0.0, float(total_length_to_end_of_line(drone_obj.pos, drone_obj.ref_line)))
+            ref_line_length = max(float(drone_obj.ref_line.length), 1e-6)
+            dist_to_goal = -dist_to_goal_coeff * (dist_left / ref_line_length)
+
+            cross_err_distance, x_error, y_error, nearest_pt = cross_track_error(host_current_point, drone_obj.ref_line)
+
+            if self.flags.get("use_path_following_reward", False):
+                coef_ref_line = 1.0
+                if detection_circle_refLine_intersect is not None:
+                    poi = np.array(
+                        [detection_circle_refLine_intersect.x, detection_circle_refLine_intersect.y],
+                        dtype=np.float64,
+                    )
+                    tangent_delta = poi - drone_obj.pos
+                    tangent_norm = np.linalg.norm(tangent_delta)
+                    if tangent_norm == 0 or not np.isfinite(tangent_norm):
+                        dist_to_ref_line = -2.0 * coef_ref_line
+                    else:
+                        tangent_vector = tangent_delta / tangent_norm
+                        if not np.all(np.isfinite(drone_obj.vel)):
+                            vel_unit_vector = np.zeros_like(drone_obj.vel)
+                        else:
+                            velocity_norm = np.linalg.norm(drone_obj.vel)
+                            if velocity_norm == 0 or not np.isfinite(velocity_norm):
+                                vel_unit_vector = np.zeros_like(drone_obj.vel)
+                            else:
+                                vel_unit_vector = drone_obj.vel / velocity_norm
+                        direction_reward = float(np.dot(vel_unit_vector, tangent_vector))
+                        if not np.isfinite(direction_reward):
+                            dist_to_ref_line = -2.0 * coef_ref_line
+                        else:
+                            clipped_direction_reward = float(np.clip(direction_reward, -1.0, 1.0))
+                            dist_to_ref_line = coef_ref_line * (clipped_direction_reward - 1.0)
+                else:
+                    dist_to_ref_line = -2.0 * coef_ref_line
+            else:
+                dist_to_ref_line = 0.0
+
+            near_drone_penalty_coef = 10.0
+            near_drone_penalty = 0.0
+            dist_to_penalty_upperbound = 10.0
+            dist_to_penalty_lowerbound = 2.5
+            all_neigh_dist.sort()
+            c_drone = 1 + (dist_to_penalty_lowerbound / (dist_to_penalty_upperbound - dist_to_penalty_lowerbound))
+            m_drone = (0 - 1) / (dist_to_penalty_upperbound - dist_to_penalty_lowerbound)
+            if nearest_neigh_key is not None:
+                for neigh_dist_idx, shortest_neigh_dist in enumerate(all_neigh_dist):
+                    if neigh_dist_idx == 2:
+                        break
+                    if dist_to_penalty_lowerbound <= shortest_neigh_dist <= dist_to_penalty_upperbound:
+                        penalty_coef = near_drone_penalty_coef
+                        if neigh_relative_bearing is not None and 90.0 <= neigh_relative_bearing < 270:
+                            penalty_coef = penalty_coef * 2
+                        near_drone_penalty = near_drone_penalty + penalty_coef * (
+                            m_drone * shortest_neigh_dist + c_drone
+                        )
+
+            small_step_penalty_coef = 5.0
+            spd_penalty_threshold = drone_obj.maxSpeed / 2
+            small_step_penalty_val = (
+                spd_penalty_threshold - np.clip(np.linalg.norm(drone_obj.vel), 0, spd_penalty_threshold)
+            ) * (1.0 / spd_penalty_threshold)
+            small_step_penalty = small_step_penalty_coef * small_step_penalty_val
+
+            dist_array = np.array([dist_info for dist_info in drone_obj.observableSpace])
+            min_index = np.argmin(dist_array)
+            min_dist = dist_array[min_index]
+
+            near_building_penalty_coef = 3.0
+            turningPtConst = 5
+            if turningPtConst == 12.5:
+                c = 1.25
+            elif turningPtConst == 5:
+                c = 2
+            m = (0 - 1) / (turningPtConst - drone_obj.protectiveBound)
+            if drone_obj.protectiveBound <= min_dist <= turningPtConst:
+                near_building_penalty = near_building_penalty_coef * (m * min_dist + c)
+            else:
+                near_building_penalty = 0.0
+
+            raw_dec_score, overall_potential_conflict_current_t = self._dec_generation(drone_idx, drone_obj)
+            if self.flags.get("use_dec_reward", False):
+                dec_score = -max(float(raw_dec_score), 0.0)
+            else:
+                dec_score = 0.0
+
+            if reached_before_step:
+                check_goal[drone_idx] = True
+                agent_to_remove.append(drone_idx)
+                rew = 0.0
+                reward.append(np.array(rew))
+                done.append(False)
+            elif x_left_bound.intersects(host_passed_volume) or x_right_bound.intersects(host_passed_volume) or y_bottom_bound.intersects(host_passed_volume) or y_top_bound.intersects(host_passed_volume):
+                drone_obj.bound_collision = True
+                rew = -crash_penalty_wall
+                if args.mode == 'eval' and evaluation_by_episode is False:
+                    done.append(False)
+                else:
+                    done.append(True)
+                bound_building_check[0] = True
+                reward.append(np.array(rew))
+            elif collide_building == 1:
+                if args.mode == 'eval' and evaluation_by_episode is False:
+                    done.append(False)
+                else:
+                    done.append(True)
+                bound_building_check[1] = True
+                rew = -crash_penalty_wall
+                reward.append(np.array(rew))
+            elif len(collision_drones) > 0:
+                if args.mode == 'eval' and evaluation_by_episode is False:
+                    done.append(False)
+                else:
+                    done.append(True)
+                bound_building_check[2] = True
+                collision_penalty = crash_penalty_wall
+                if neigh_collision_bearing is not None and 90.0 <= neigh_collision_bearing <= 180:
+                    collision_penalty = collision_penalty * 2
+                rew = -collision_penalty
+                reward.append(np.array(rew))
+                if flag_previous_nearest_two:
+                    bound_building_check[3] = True
+            elif not goal_cur_intru_intersect.is_empty:
+                drone_obj.reach_target = True
+                check_goal[drone_idx] = True
+                agent_to_remove.append(drone_idx)
+                rew = 0.0
+                reward.append(np.array(rew))
+                done.append(False)
+            else:
+                if xy[0] is None and xy[1] is None:
+                    if wp_intersect_flag and len(drone_obj.waypoints) > 1:
+                        drone_obj.removed_goal = drone_obj.waypoints.pop(0)
+                rew = (
+                    dist_to_ref_line
+                    + dist_to_goal
+                    - small_step_penalty
+                    - near_building_penalty
+                    - near_drone_penalty
+                    + dec_score
+                )
+                done.append(False)
+                reward.append(np.array(rew))
+
+            step_reward_record[drone_idx] = [dist_to_ref_line, rew]
+            eps_status_holder = self.display_one_eps_status(
+                eps_status_holder,
+                drone_idx,
+                np.array(after_dist_hg),
+                [
+                    np.array(dist_to_goal), cross_err_distance, dist_to_ref_line,
+                    np.array(near_building_penalty), small_step_penalty,
+                    np.linalg.norm(drone_obj.vel), 0.0,
+                    0.0, nearest_pt, drone_obj.observableSpace,
+                    drone_obj.heading, np.array(near_drone_penalty), np.array(dec_score),
+                    overall_potential_conflict_current_t,
+                ],
+            )
+
+        reach_target_state = [agent.reach_target for _, agent in self.all_uavs.items()]
+        goal_state_mismatch = [
+            {
+                "agent_idx": agent_idx,
+                "check_goal": check_goal[agent_idx],
+                "reach_target": agent.reach_target,
+                "bound_collision": agent.bound_collision,
+                "building_collision": agent.building_collision,
+                "drone_collision": agent.drone_collision,
+                "position": agent.pos.tolist() if isinstance(agent.pos, np.ndarray) else agent.pos,
+                "goal": agent.goal[-1].tolist() if isinstance(agent.goal[-1], np.ndarray) else agent.goal[-1],
+                "reward": float(reward[agent_idx]) if agent_idx < len(reward) else None,
+                "done": bool(done[agent_idx]) if agent_idx < len(done) else None,
+                "bound_building_check": list(bound_building_check),
+            }
+            for agent_idx, agent in self.all_uavs.items()
+            if check_goal[agent_idx] != agent.reach_target
+        ]
+        if goal_state_mismatch:
+            raise ValueError(
+                "ss_reward_2026 goal-state mismatch detected. check_goal={} reach_target={} details={}".format(
                     check_goal,
                     reach_target_state,
                     goal_state_mismatch,

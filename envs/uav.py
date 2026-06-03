@@ -33,6 +33,9 @@ class UAV:
         self.waypoints = None
         self.ref_line = None
         self.ref_line_segments = None
+        self.planned_path_grid = []
+        self.planned_path_world = []
+        self.path_planner = None
         self.heading = None
         # self.detectionRange = 30  # in meters, this is the in diameter
         # self.detectionRange = 40  # in meters, this is the in diameter

@@ -235,11 +235,21 @@ def _init_wandb(config):
 
     os.environ.setdefault("WANDB_DISABLE_GIT", "true")
     os.environ.setdefault("WANDB_CONSOLE", "off")
-    wandb.init(
+    algorithm = str(config.get("algorithm", "unknown_algorithm")).lower()
+    run = wandb.init(
         project="MARL_2026_combine",
         name=_wandb_run_name(config),
         config=config,
+        job_type=str(config.get("mode", "train")),
+        tags=[algorithm],
         save_code=False,
+    )
+    run.config.update(
+        {
+            "algorithm": algorithm,
+            "algo": algorithm,
+        },
+        allow_val_change=True,
     )
     return wandb
 
@@ -352,14 +362,22 @@ def _write_training_log_header(log_path, checkpoint_dir, checkpoint_kind, checkp
 
 
 def _append_evaluation_log(log_path, eval_summary):
+    eval_summary = eval_summary or {}
+
+    def _summary_int(*keys):
+        for key in keys:
+            if key in eval_summary and eval_summary[key] is not None:
+                return int(eval_summary[key])
+        return 0
+
     with open(log_path, "a") as handle:
         handle.write("\nEvaluation Summary\n")
-        handle.write("Total collision: {}\n".format(int(eval_summary["total_collision"])))
-        handle.write("Collision to bound: {}\n".format(int(eval_summary["collision_to_bound"])))
-        handle.write("Collision to building: {}\n".format(int(eval_summary["collision_to_building"])))
-        handle.write("Collision to drone: {}\n".format(int(eval_summary["collision_to_drone"])))
-        handle.write("Destination reached: {}\n".format(int(eval_summary["destination_reached"])))
-        handle.write("Idle UAV: {}\n".format(int(eval_summary["idle_uav"])))
+        handle.write("Total collision {}\n".format(_summary_int("total_collision")))
+        handle.write("Collision to bound {}\n".format(_summary_int("collision_to_bound")))
+        handle.write("Collision to building {}\n".format(_summary_int("collision_to_building")))
+        handle.write("Collision to drone {}\n".format(_summary_int("collision_to_drone")))
+        handle.write("Destination reached {}\n".format(_summary_int("destination_reached", "reached_goal_drones")))
+        handle.write("Idle UAV {}\n".format(_summary_int("idle_uav")))
 
 
 def _append_evaluation_status(log_path, status, message=None):
@@ -679,8 +697,8 @@ def main(config):
     except Exception as exc:
         _append_evaluation_status(log_path, "failed", repr(exc))
         raise
-    _append_evaluation_status(log_path, "completed")
     _append_evaluation_log(log_path, eval_summary)
+    _append_evaluation_status(log_path, "completed")
 
     print(f"[TRAIN] Total wall-clock time: {total_wall_clock:.2f}s")
     print(f"[TRAIN] Finished. Checkpoints saved to: {checkpoint_dir}")
