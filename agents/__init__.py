@@ -1,3 +1,4 @@
+from agents.att_iddpg.trainer import ATTIDDPGTrainer
 from agents.fm_iddpg.trainer import FMIDDPGTrainer
 from agents.iddpg.trainer import IDDPGTrainer
 from agents.maac.trainer import MAACTrainer
@@ -12,6 +13,8 @@ def build_trainer(args):
 
     if algo == "iddpg":
         return IDDPGTrainer(args)
+    elif algo == "att-iddpg":
+        return ATTIDDPGTrainer(args)
     elif algo == "fm-iddpg":
         return FMIDDPGTrainer(args)
     elif algo in ("maddpg", "maddpg-critic-attention"):

@@ -8,16 +8,16 @@ DEFAULT_CONFIG = {
     "seed": 777,
     "device": "auto",
     "dtype": "float32",
-    "mode": "train",  # or evaluate
-    "algorithm": "matd3",  # or maddpg, maddpg-critic-attention, mappo, maac, matd3, matd3-critic-attention, iddpg, fm-iddpg, orca
+    "mode": "evaluate",  # or evaluate
+    "algorithm": "maac",  # or maddpg, maddpg-critic-attention, mappo, maac, matd3, matd3-critic-attention, iddpg, att-iddpg, fm-iddpg, orca
     "exp_name": "default_exp",
     "save_interval": 5000,
     "paths": {
         "project_root": str(PROJECT_ROOT),
         "resource_env_var": DEFAULT_RESOURCE_ENV_VAR,
         "checkpoint_dir": "checkpoints",
-        #"checkpoint_run": "190526_09_31_31",  # this is for evaluation
-        "checkpoint_run": None,  # this is also used for training folder saving; training uses None
+        "checkpoint_run": "020626_05_47_51",  # this is for evaluation
+        # "checkpoint_run": None,  # this is also used for training folder saving; training uses None
         "checkpoint_kind": "step",  # ep
         "checkpoint_value": 450000,
         "resource_file": None,
@@ -28,7 +28,7 @@ DEFAULT_CONFIG = {
         "orca_code_dir": r"F:\githubClone\deepQ_learning_newVer\nf_dqn_v3_2_LSTM_Attention",
     },
     "env": {
-        "n_agents": 8,
+        "n_agents": 15,
         "action_dim": 2,
         "max_steps": 100,
         "nearest_neighbor_count": 3,
@@ -74,6 +74,7 @@ DEFAULT_CONFIG = {
         "policy_noise": 0,
         "noise_clip": 0,
         "policy_delay": 1,
+        "tcpa_bias_scale": 4.0,
     },
     "exploration": {
         "eps_start": 1.0,
@@ -96,12 +97,12 @@ DEFAULT_CONFIG = {
         "use_all_neigh_with_radar": True,  # for iddpg only, keep it, otherwise training will fail
         "use_critic_attention": False,
         "use_dec_reward": False,
-        "use_path_following_reward": False,
+        "use_path_following_reward": True,
         "include_building_in_overall_conflict": True,
         "own_obs_only": False,
     },
     "eval": {
-        "episodes": 100,
+        "episodes": 10,
     },
 }
 
@@ -142,7 +143,7 @@ def get_args():
         "--algo",
         type=str,
         default=DEFAULT_CONFIG["algorithm"],
-        choices=["iddpg", "fm-iddpg", "maddpg", "maddpg-critic-attention", "mappo", "maac", "matd3", "matd3-critic-attention", "orca"],
+        choices=["iddpg", "att-iddpg", "fm-iddpg", "maddpg", "maddpg-critic-attention", "mappo", "maac", "matd3", "matd3-critic-attention", "orca"],
     )
     parser.add_argument("--exp_name", type=str, default=DEFAULT_CONFIG["exp_name"])
 
@@ -206,6 +207,7 @@ def get_args():
     parser.add_argument("--policy_noise", type=float, default=DEFAULT_CONFIG["train"]["policy_noise"])
     parser.add_argument("--noise_clip", type=float, default=DEFAULT_CONFIG["train"]["noise_clip"])
     parser.add_argument("--policy_delay", type=int, default=DEFAULT_CONFIG["train"]["policy_delay"])
+    parser.add_argument("--tcpa_bias_scale", type=float, default=DEFAULT_CONFIG["train"]["tcpa_bias_scale"])
 
     parser.add_argument("--eps_start", type=float, default=DEFAULT_CONFIG["exploration"]["eps_start"])
     parser.add_argument("--eps_end", type=float, default=DEFAULT_CONFIG["exploration"]["eps_end"])
@@ -324,6 +326,7 @@ def build_config(args):
     config["train"]["policy_noise"] = args.policy_noise
     config["train"]["noise_clip"] = args.noise_clip
     config["train"]["policy_delay"] = args.policy_delay
+    config["train"]["tcpa_bias_scale"] = float(args.tcpa_bias_scale)
 
     config["exploration"]["eps_start"] = args.eps_start
     config["exploration"]["eps_end"] = args.eps_end

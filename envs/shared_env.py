@@ -2155,21 +2155,19 @@ class SharedMultiAgentEnv:
                         p1_norm_surround_agent = np.append(p1_norm_surround_agent, agent.heading)
                         # p1_norm_surround_agent = np.concatenate([norm_nei_pos, norm_neigh_vel, ], axis=0)
 
-                        surround_agent = np.array([[other_agent[0] - agent.pos[0],
-                                                    other_agent[1] - agent.pos[1],
-                                                    other_agent[-2] - other_agent[0],
-                                                    other_agent[-1] - other_agent[1],
-                                                    other_agent[2], other_agent[3]]])
+                        surround_agent = np.array([[
+                            delta_host_x,
+                            delta_host_y,
+                            agent.vel[0],
+                            agent.vel[1],
+                            cur_neigh_vx,
+                            cur_neigh_vy,
+                            agent.protectiveBound,
+                            self.all_uavs[other_agentIdx].protectiveBound,
+                            nei_heading,
+                        ]])
 
-                        norm_pos_diff = self.normalizer.nmlz_pos_diff(
-                            [other_agent[0] - agent.pos[0], other_agent[1] - agent.pos[1]])
-
-                        norm_G_diff = self.normalizer.nmlz_pos_diff(
-                            [other_agent[-2] - other_agent[0], other_agent[-1] - other_agent[1]])
-
-                        norm_vel = tuple(self.normalizer.nmlz_vel([other_agent[2], other_agent[3]]))
-                        # norm_vel = self.normalizer.nmlz_vel([other_agent[2], other_agent[3]])
-                        norm_surround_agent = np.array([list(norm_pos_diff + norm_G_diff + norm_vel)])
+                        norm_surround_agent = surround_agent.copy()
 
                         other_agents.append(surround_agent)
                         norm_other_agents.append(norm_surround_agent)
@@ -2184,8 +2182,8 @@ class SharedMultiAgentEnv:
                 overall_state_p3.append(other_agents)
                 norm_overall_state_p3.append(norm_other_agents)
             else:
-                overall_state_p3.append([np.zeros((1, 6))])
-                norm_overall_state_p3.append([np.zeros((1, 6))])
+                overall_state_p3.append([np.zeros((1, 9))])
+                norm_overall_state_p3.append([np.zeros((1, 9))])
 
             max_neigh_count = self._get_observation_neighbor_capacity()
             filling_required = max_neigh_count - len(observation_neighbors)
@@ -3239,7 +3237,7 @@ class SharedMultiAgentEnv:
         )
 
         step_reward_record = [None] * self.n_agents
-        rewards, dones, check_goal, step_reward_record, status_holder, step_collision_record, bound_building_check = self.ss_reward_2026(
+        rewards, dones, check_goal, step_reward_record, status_holder, step_collision_record, bound_building_check = self.ss_reward_Mar(
             current_ts,
             step_reward_record,
             self._step_collision_record,
