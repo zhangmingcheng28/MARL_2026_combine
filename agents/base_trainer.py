@@ -24,3 +24,6 @@ class BaseTrainer(ABC):
     @abstractmethod
     def load(self, path: str, checkpoint_tag: str = None):
         raise NotImplementedError
+
+    def load_for_eval(self, path: str, checkpoint_tag: str = None):
+        self.load(path, checkpoint_tag=checkpoint_tag)

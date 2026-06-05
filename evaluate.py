@@ -27,7 +27,7 @@ def main(config):
     checkpoint_paths = config.get("paths", {})
     checkpoint_dir = checkpoint_paths.get("checkpoint_dir", "checkpoints")
     checkpoint_tag = _build_checkpoint_tag(checkpoint_paths)
-    trainer.load(checkpoint_dir, checkpoint_tag=checkpoint_tag)
+    trainer.load_for_eval(checkpoint_dir, checkpoint_tag=checkpoint_tag)
     if checkpoint_tag:
         print(f"[EVAL] Loading checkpoint '{checkpoint_tag}' from: {checkpoint_dir}")
     else:

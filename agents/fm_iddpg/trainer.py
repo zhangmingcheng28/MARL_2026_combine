@@ -43,6 +43,7 @@ class FMIDDPGTrainer(BaseTrainer):
         self.action_step = 0
         self.current_episode = 1
         self.pending_load_path = None
+        self.pending_eval_load_path = None
         self.max_grad_norm = float(config["train"].get("max_grad_norm", 0.0))
         self.last_action_info = {}
         self.last_update_info = {
@@ -118,6 +119,10 @@ class FMIDDPGTrainer(BaseTrainer):
             pending_path, pending_checkpoint_tag = self.pending_load_path
             self._load_state(pending_path, pending_checkpoint_tag)
             self.pending_load_path = None
+        if self.pending_eval_load_path is not None:
+            pending_path, pending_checkpoint_tag = self.pending_eval_load_path
+            self._load_actor_state(pending_path, pending_checkpoint_tag)
+            self.pending_eval_load_path = None
 
     def begin_episode(self, episode):
         self.current_episode = max(1, int(episode))
@@ -460,8 +465,23 @@ class FMIDDPGTrainer(BaseTrainer):
         self.actor_target = deepcopy(self.actor)
         self.critic_target = deepcopy(self.critic)
 
+    def _load_actor_state(self, path, checkpoint_tag=None):
+        actor_name = "fm_iddpg_actor.pt"
+        if checkpoint_tag:
+            actor_name = f"fm_iddpg_actor_{checkpoint_tag}.pt"
+
+        actor_path = os.path.join(path, actor_name)
+        self.actor.load_state_dict(torch.load(actor_path, map_location=self.device))
+        self.actor_target = deepcopy(self.actor)
+
     def load(self, path, checkpoint_tag=None):
         if self.actor is None or self.critic is None:
             self.pending_load_path = (path, checkpoint_tag)
             return
         self._load_state(path, checkpoint_tag)
+
+    def load_for_eval(self, path, checkpoint_tag=None):
+        if self.actor is None:
+            self.pending_eval_load_path = (path, checkpoint_tag)
+            return
+        self._load_actor_state(path, checkpoint_tag)

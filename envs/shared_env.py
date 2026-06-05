@@ -3239,7 +3239,7 @@ class SharedMultiAgentEnv:
         )
 
         step_reward_record = [None] * self.n_agents
-        rewards, dones, check_goal, step_reward_record, status_holder, step_collision_record, bound_building_check = self.ss_reward_Mar(
+        rewards, dones, check_goal, step_reward_record, status_holder, step_collision_record, bound_building_check = self.ss_reward_2026(
             current_ts,
             step_reward_record,
             self._step_collision_record,

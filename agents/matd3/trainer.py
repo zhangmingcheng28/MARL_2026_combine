@@ -61,6 +61,7 @@ class MATD3Trainer(BaseTrainer):
         self.current_episode = 1
         self.action_step = 0
         self.pending_load_path = None
+        self.pending_eval_load_path = None
 
         self.buffer = ReplayBuffer(config["train"]["buffer_size"])
         self.last_action_info = {}
@@ -193,6 +194,9 @@ class MATD3Trainer(BaseTrainer):
         if self.pending_load_path is not None:
             self._load_state(*self.pending_load_path)
             self.pending_load_path = None
+        if self.pending_eval_load_path is not None:
+            self._load_actor_state(*self.pending_eval_load_path)
+            self.pending_eval_load_path = None
 
         return flattened_obs
 
@@ -454,8 +458,19 @@ class MATD3Trainer(BaseTrainer):
         self.target_critic1.load_state_dict(self.critic1.state_dict())
         self.target_critic2.load_state_dict(self.critic2.state_dict())
 
+    def _load_actor_state(self, path, checkpoint_tag=None):
+        actor_name = "matd3_actor.pt" if checkpoint_tag is None else f"matd3_actor_{checkpoint_tag}.pt"
+        self.actor.load_state_dict(torch.load(os.path.join(path, actor_name), map_location=self.device))
+        self.target_actor.load_state_dict(self.actor.state_dict())
+
     def load(self, path, checkpoint_tag=None):
         if self.actor is None or self.critic1 is None or self.critic2 is None:
             self.pending_load_path = (path, checkpoint_tag)
             return
         self._load_state(path, checkpoint_tag)
+
+    def load_for_eval(self, path, checkpoint_tag=None):
+        if self.actor is None or self.target_actor is None:
+            self.pending_eval_load_path = (path, checkpoint_tag)
+            return
+        self._load_actor_state(path, checkpoint_tag)

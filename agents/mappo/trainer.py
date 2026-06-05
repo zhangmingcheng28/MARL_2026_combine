@@ -61,6 +61,7 @@ class MAPPOTrainer(BaseTrainer):
         self.current_episode = 1
         self.action_step = 0
         self.pending_load_path = None
+        self.pending_eval_load_path = None
         self.pending_action_meta = deque()
 
         self.buffer = MAPPORolloutBuffer()
@@ -204,6 +205,9 @@ class MAPPOTrainer(BaseTrainer):
         if self.pending_load_path is not None:
             self._load_state(*self.pending_load_path)
             self.pending_load_path = None
+        if self.pending_eval_load_path is not None:
+            self._load_actor_state(*self.pending_eval_load_path)
+            self.pending_eval_load_path = None
 
         return flattened_obs
 
@@ -469,8 +473,22 @@ class MAPPOTrainer(BaseTrainer):
         if "log_std" in actor_payload:
             self.log_std.data.copy_(actor_payload["log_std"].to(device=self.device, dtype=self.torch_dtype))
 
+    def _load_actor_state(self, path, checkpoint_tag=None):
+        actor_name = "mappo_actor.pt" if checkpoint_tag is None else f"mappo_actor_{checkpoint_tag}.pt"
+        actor_payload = torch.load(os.path.join(path, actor_name), map_location=self.device)
+        actor_state_dict = actor_payload.get("actor_state_dict", actor_payload)
+        self.actor.load_state_dict(actor_state_dict)
+        if "log_std" in actor_payload:
+            self.log_std.data.copy_(actor_payload["log_std"].to(device=self.device, dtype=self.torch_dtype))
+
     def load(self, path, checkpoint_tag=None):
         if self.actor is None or self.critic is None or self.log_std is None:
             self.pending_load_path = (path, checkpoint_tag)
             return
         self._load_state(path, checkpoint_tag)
+
+    def load_for_eval(self, path, checkpoint_tag=None):
+        if self.actor is None or self.log_std is None:
+            self.pending_eval_load_path = (path, checkpoint_tag)
+            return
+        self._load_actor_state(path, checkpoint_tag)
