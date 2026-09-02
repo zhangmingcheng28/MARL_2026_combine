@@ -17,6 +17,8 @@ def _build_checkpoint_tag(paths_config):
 def _select_actions(trainer, env, norm_cur_state, evaluate):
     if hasattr(trainer, "select_action_from_env"):
         return trainer.select_action_from_env(env, evaluate=evaluate)
+    if hasattr(trainer, "select_action_with_context"):
+        return trainer.select_action_with_context(norm_cur_state, context_id="eval-0", evaluate=evaluate)
     return trainer.select_action(norm_cur_state, evaluate=evaluate)
 
 
@@ -57,6 +59,8 @@ def main(config):
     for episode in range(1, eval_episodes + 1):
         if hasattr(trainer, "begin_episode"):
             trainer.begin_episode(episode)
+        if hasattr(trainer, "reset_context"):
+            trainer.reset_context("eval-0")
         cur_state, norm_cur_state = env.reset(episode, show=0)
         accum_reward = 0
         step = 0

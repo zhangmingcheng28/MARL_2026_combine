@@ -6,3 +6,6 @@
 !/resources/precomputed_maps/*.pickle
 *.pickle
 *.docx
+*.pyc
+*.pyc
+*.pyc

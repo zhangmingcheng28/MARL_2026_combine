@@ -8,15 +8,15 @@ DEFAULT_CONFIG = {
     "seed": 777,
     "device": "auto",
     "dtype": "float32",
-    "mode": "evaluate",  # or evaluate
-    "algorithm": "maac",  # or maddpg, maddpg-critic-attention, mappo, maac, matd3, matd3-critic-attention, iddpg, att-iddpg, fm-iddpg, orca
+    "mode": "evaluate",  # or evaluate or train
+    "algorithm": "pcb_biased_att_iddpg",  # or maddpg, maddpg-critic-attention, mappo, maac, matd3, matd3-critic-attention, iddpg, att-iddpg, pcb_biased_att_iddpg, learned_pcb_biased_att_iddpg, gru-iddpg, fm-iddpg, orca
     "exp_name": "default_exp",
     "save_interval": 5000,
     "paths": {
         "project_root": str(PROJECT_ROOT),
         "resource_env_var": DEFAULT_RESOURCE_ENV_VAR,
         "checkpoint_dir": "checkpoints",
-        "checkpoint_run": "020626_05_47_51",  # this is for evaluation
+        "checkpoint_run": "200726_08_49_19",  # this is for evaluation
         # "checkpoint_run": None,  # this is also used for training folder saving; training uses None
         "checkpoint_kind": "step",  # ep
         "checkpoint_value": 450000,
@@ -28,10 +28,10 @@ DEFAULT_CONFIG = {
         "orca_code_dir": r"F:\githubClone\deepQ_learning_newVer\nf_dqn_v3_2_LSTM_Attention",
     },
     "env": {
-        "n_agents": 15,
+        "n_agents": 8,
         "action_dim": 2,
         "max_steps": 100,
-        "nearest_neighbor_count": 3,
+        "nearest_neighbor_count": 0,
         "grid_obs_shape": [7, 7],
         "bound": [455, 680, 255, 385],
         "max_x": 1800,
@@ -40,7 +40,8 @@ DEFAULT_CONFIG = {
         "acc_max": 8,
         "max_speed": 5,
         "random_map_idx": [3],
-        "neighbour_search_distance": 100000,
+        # "neighbour_search_distance": 100000,
+        "neighbour_search_distance": 30,
         # "path_planner": "cbs",
         "path_planner": "astar",
         "planner_fallback": "jps",
@@ -75,6 +76,12 @@ DEFAULT_CONFIG = {
         "noise_clip": 0,
         "policy_delay": 1,
         "tcpa_bias_scale": 4.0,
+        "beta": 1.0,
+        "gru_history_length": 4,
+    },
+    "augment": {
+        "position_noise_mu": 0.0,
+        "position_noise_sigma": 0.0,
     },
     "exploration": {
         "eps_start": 1.0,
@@ -102,7 +109,7 @@ DEFAULT_CONFIG = {
         "own_obs_only": False,
     },
     "eval": {
-        "episodes": 10,
+        "episodes": 100,
     },
 }
 
@@ -143,7 +150,7 @@ def get_args():
         "--algo",
         type=str,
         default=DEFAULT_CONFIG["algorithm"],
-        choices=["iddpg", "att-iddpg", "fm-iddpg", "maddpg", "maddpg-critic-attention", "mappo", "maac", "matd3", "matd3-critic-attention", "orca"],
+        choices=["iddpg", "att-iddpg", "pcb_biased_att_iddpg", "learned_pcb_biased_att_iddpg", "gru-iddpg", "fm-iddpg", "maddpg", "maddpg-critic-attention", "mappo", "maac", "matd3", "matd3-critic-attention", "orca"],
     )
     parser.add_argument("--exp_name", type=str, default=DEFAULT_CONFIG["exp_name"])
 
@@ -208,6 +215,10 @@ def get_args():
     parser.add_argument("--noise_clip", type=float, default=DEFAULT_CONFIG["train"]["noise_clip"])
     parser.add_argument("--policy_delay", type=int, default=DEFAULT_CONFIG["train"]["policy_delay"])
     parser.add_argument("--tcpa_bias_scale", type=float, default=DEFAULT_CONFIG["train"]["tcpa_bias_scale"])
+    parser.add_argument("--beta", type=float, default=DEFAULT_CONFIG["train"]["beta"])
+    parser.add_argument("--gru_history_length", type=int, default=DEFAULT_CONFIG["train"]["gru_history_length"])
+    parser.add_argument("--position_noise_mu", type=float, default=DEFAULT_CONFIG["augment"]["position_noise_mu"])
+    parser.add_argument("--position_noise_sigma", type=float, default=DEFAULT_CONFIG["augment"]["position_noise_sigma"])
 
     parser.add_argument("--eps_start", type=float, default=DEFAULT_CONFIG["exploration"]["eps_start"])
     parser.add_argument("--eps_end", type=float, default=DEFAULT_CONFIG["exploration"]["eps_end"])
@@ -327,6 +338,8 @@ def build_config(args):
     config["train"]["noise_clip"] = args.noise_clip
     config["train"]["policy_delay"] = args.policy_delay
     config["train"]["tcpa_bias_scale"] = float(args.tcpa_bias_scale)
+    config["train"]["beta"] = float(args.beta)
+    config["train"]["gru_history_length"] = max(1, int(args.gru_history_length))
 
     config["exploration"]["eps_start"] = args.eps_start
     config["exploration"]["eps_end"] = args.eps_end
@@ -356,6 +369,8 @@ def build_config(args):
 
     config["env"]["full_observable_critic"] = config["flags"]["full_observable_critic"]
     config["env"]["evaluation_by_episode"] = config["flags"]["evaluation_by_episode"]
+    config["augment"]["position_noise_mu"] = float(args.position_noise_mu)
+    config["augment"]["position_noise_sigma"] = float(args.position_noise_sigma)
 
     config["eval"]["episodes"] = args.eval_episodes
 

@@ -3,6 +3,7 @@ from argparse import Namespace
 from importlib import util
 from pathlib import Path
 from typing import Optional
+from augment import GaussianPositionObservationAugmentor
 from config.paths import PROJECT_ROOT, resolve_path
 from utils.env_simulator_helper import *
 import matplotlib.pyplot as plt
@@ -111,6 +112,7 @@ class SharedMultiAgentEnv:
         self.mode = mode
         self.path_planner = str(path_planner).lower()
         self.planner_fallback = str(planner_fallback)
+        self.observation_augmentor = GaussianPositionObservationAugmentor(0.0, 0.0)
         self.nearest_neighbor_count = 0
         self.step_count = 0
         self.episode_count = 0
@@ -263,6 +265,11 @@ class SharedMultiAgentEnv:
             planner_fallback=env_cfg.get("planner_fallback", "astar,jps"),
         )
         env.nearest_neighbor_count = max(0, int(env_cfg.get("nearest_neighbor_count", 0)))
+        augment_cfg = config.get("augment", {})
+        env.observation_augmentor = GaussianPositionObservationAugmentor(
+            augment_cfg.get("position_noise_mu", 0.0),
+            augment_cfg.get("position_noise_sigma", 0.0),
+        )
         if env.map_bundle_dir is not None:
             env._load_precomputed_map_bundle()
         else:
@@ -1210,6 +1217,7 @@ class SharedMultiAgentEnv:
             all_agent_line_collection, all_agent_mini_intersection_list = self.cur_state_norm_state_v3(agentRefer_dict,
                                                                                                        self.flags[
                                                                                                            "full_observable_critic"])
+        overall_state, norm_overall_state = self.observation_augmentor.apply(overall_state, norm_overall_state)
         if show:
             os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
             matplotlib.use('TkAgg')
@@ -3236,6 +3244,7 @@ class SharedMultiAgentEnv:
             self.full_observable_critic,
         )
 
+        augmented_next_state, augmented_next_state_norm = self.observation_augmentor.apply(next_state, next_state_norm)
         step_reward_record = [None] * self.n_agents
         rewards, dones, check_goal, step_reward_record, status_holder, step_collision_record, bound_building_check = self.ss_reward_Mar(
             current_ts,
@@ -3262,4 +3271,4 @@ class SharedMultiAgentEnv:
             "all_agent_line_collection": all_agent_line_collection,
             "all_agent_mini_intersection_list": all_agent_mini_intersection_list,
         }
-        return next_state_norm, next_state, rewards, dones, info
+        return augmented_next_state_norm, augmented_next_state, rewards, dones, info

@@ -5,10 +5,10 @@ import torch.nn as nn
 
 
 class ConflictAwareNeighborAttention(nn.Module):
-    def __init__(self, query_dim, token_dim, hidden_dim=128, tcpa_bias_scale=4.0):
+    def __init__(self, query_dim, token_dim, hidden_dim=128, beta=1.0):
         super().__init__()
         self.hidden_dim = hidden_dim
-        self.tcpa_bias_scale = float(tcpa_bias_scale)
+        self.beta = float(beta)
         self.query_proj = nn.Linear(query_dim, hidden_dim)
         self.key_proj = nn.Linear(hidden_dim, hidden_dim)
         self.value_proj = nn.Linear(hidden_dim, hidden_dim)
@@ -18,26 +18,45 @@ class ConflictAwareNeighborAttention(nn.Module):
         )
 
     @staticmethod
-    def _build_tcpa_bias(neighbor_tokens, valid_mask, eps=1e-6):
+    def build_conflict_risk(
+        neighbor_tokens,
+        valid_mask,
+        tcpa_threshold=2.0,
+        tcpa_smoothness=0.5,
+        dcpa_smoothness_ratio=0.1,
+        eps=1e-6,
+    ):
         rel_pos = neighbor_tokens[..., 0:2]
         host_vel = neighbor_tokens[..., 2:4]
         neigh_vel = neighbor_tokens[..., 4:6]
-        host_bound = neighbor_tokens[..., 6]
-        neigh_bound = neighbor_tokens[..., 7]
+        host_radius = neighbor_tokens[..., 6]
+        neigh_radius = neighbor_tokens[..., 7]
         rel_vel = neigh_vel - host_vel
-        rel_speed_sq = (rel_vel ** 2).sum(dim=-1).clamp_min(eps)
+
+        rel_speed_sq = rel_vel.square().sum(dim=-1).clamp_min(eps)
+
         tcpa = -(rel_pos * rel_vel).sum(dim=-1) / rel_speed_sq
         closest_rel_pos = rel_pos + tcpa.unsqueeze(-1) * rel_vel
         dcpa = torch.linalg.norm(closest_rel_pos, dim=-1)
-        potential_mask = valid_mask & (tcpa > 0.0) & (dcpa <= (host_bound + neigh_bound))  # True when this neighbour actually exisit, and encounter is ahead, predicted cloeset distance is dangerous.
 
-        tcpa_bias = torch.full_like(tcpa, -2.0)  # start by assigning every neighbour a default bias of -2.0
-        tcpa_bias = torch.where(
-            potential_mask,
-            1.0 / (1.0 + tcpa),  # give larger bias to neighbors whose closest approach happens sooner, monotonic decreasing, smaller tcpa, larger value
-            tcpa_bias,
-        )  #  then, only for neighbours where potential_mask is TRUE, replace that -2.0 with 1.0 / (1.0 + tcpa)
-        return tcpa_bias
+        protective_distance = host_radius + neigh_radius
+
+        time_risk = torch.sigmoid((tcpa_threshold - tcpa) / tcpa_smoothness)
+
+        dcpa_smoothness = (dcpa_smoothness_ratio * protective_distance).clamp_min(eps)
+
+        distance_risk = torch.sigmoid((protective_distance - dcpa) / dcpa_smoothness)
+
+        future_cpa = tcpa > 0.0
+
+        conflict_risk = (
+            time_risk
+            * distance_risk
+            * future_cpa.float()
+            * valid_mask.float()
+        )
+
+        return conflict_risk, tcpa, dcpa
 
     def forward(self, query_source, neighbor_tokens, valid_mask=None):
         if valid_mask is None:
@@ -53,8 +72,9 @@ class ConflictAwareNeighborAttention(nn.Module):
         keys = self.key_proj(encoded_tokens)
         values = self.value_proj(encoded_tokens)
 
-        logits = (query * keys).sum(dim=-1) / math.sqrt(float(self.hidden_dim))  # original style: query @ keys.transpose(-2, -1) / sqrt(self.hidden_dim)
-        logits = logits + self.tcpa_bias_scale * self._build_tcpa_bias(neighbor_tokens, safe_mask)  # compute extra attention score for each neighbour based on collision risk geometry, hand-crafted bias added to the score term before softmax
+        learned_logits = (query * keys).sum(dim=-1) / math.sqrt(float(self.hidden_dim))  # original style: query @ keys.transpose(-2, -1) / sqrt(self.hidden_dim)
+        conflict_risk, tcpa, dcpa = self.build_conflict_risk(neighbor_tokens, valid_mask)
+        logits = learned_logits + self.beta * conflict_risk
         logits = logits.masked_fill(~safe_mask, -1e9)  # safe mask: valid_mask is for sample that is having valid neighbour, is True, else is False. While safe_mask, is a copy of it but samples that all neighbours are False, we set the 1st value to True.
 
         weights = torch.softmax(logits, dim=-1)
@@ -64,7 +84,7 @@ class ConflictAwareNeighborAttention(nn.Module):
 
 
 class ActorNetworkVariableNeiWRadar(nn.Module):
-    def __init__(self, own_dim, radar_dim, neighbor_token_dim, action_dim, tcpa_bias_scale=4.0):
+    def __init__(self, own_dim, radar_dim, neighbor_token_dim, action_dim, beta=1.0):
         super().__init__()
         self.own_fc = nn.Sequential(nn.Linear(own_dim, 64), nn.ReLU())
         self.radar_fc = nn.Sequential(nn.Linear(radar_dim, 64), nn.ReLU())
@@ -72,7 +92,7 @@ class ActorNetworkVariableNeiWRadar(nn.Module):
             64 + 64,
             neighbor_token_dim,
             hidden_dim=128,
-            tcpa_bias_scale=tcpa_bias_scale,
+            beta=beta,
         )
         self.merge_feature = nn.Sequential(nn.Linear(64 + 64 + 128, 256), nn.ReLU())
         self.act_out = nn.Sequential(
@@ -94,7 +114,7 @@ class ActorNetworkVariableNeiWRadar(nn.Module):
 
 
 class CriticNetworkVariableNeiWRadar(nn.Module):
-    def __init__(self, own_dim, radar_dim, neighbor_token_dim, action_dim, tcpa_bias_scale=4.0):
+    def __init__(self, own_dim, radar_dim, neighbor_token_dim, action_dim, beta=1.0):
         super().__init__()
         self.own_action_fc = nn.Sequential(nn.Linear(own_dim + action_dim, 64), nn.ReLU())
         self.radar_fc = nn.Sequential(nn.Linear(radar_dim, 64), nn.ReLU())
@@ -102,7 +122,7 @@ class CriticNetworkVariableNeiWRadar(nn.Module):
             64 + 64,
             neighbor_token_dim,
             hidden_dim=128,
-            tcpa_bias_scale=tcpa_bias_scale,
+            beta=beta,
         )
         self.merge_feature = nn.Sequential(nn.Linear(64 + 64 + 128, 512), nn.ReLU())
         self.out_feature_q = nn.Sequential(

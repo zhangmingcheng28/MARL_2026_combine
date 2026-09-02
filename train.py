@@ -39,6 +39,9 @@ def _start_episode_run(env_slot, trainer, episode_id, backend):
     episode_start_time = time.perf_counter()
     if hasattr(trainer, "begin_episode"):
         trainer.begin_episode(episode_id)
+    context_id = str(env_slot.get("env_idx", "serial-0"))
+    if hasattr(trainer, "reset_context"):
+        trainer.reset_context(context_id)
     if backend == "subproc":
         cur_state, norm_cur_state, agent_snapshot = env_slot["vec_env"].reset_at(env_slot["env_idx"], episode_id)
         n_agents = env_slot["n_agents"]
@@ -51,6 +54,7 @@ def _start_episode_run(env_slot, trainer, episode_id, backend):
         "env_slot": env_slot,
         "episode_id": episode_id,
         "episode_start_time": episode_start_time,
+        "context_id": context_id,
         "cur_state": cur_state,
         "norm_cur_state": norm_cur_state,
         "episode_reward": 0.0,
@@ -341,6 +345,9 @@ def _select_actions(trainer, env_slot, norm_cur_state, evaluate):
         if "env" not in env_slot:
             raise ValueError("The ORCA algorithm does not support subprocess/vectorized environments.")
         return trainer.select_action_from_env(env_slot["env"], evaluate=evaluate)
+    if hasattr(trainer, "select_action_with_context"):
+        context_id = str(env_slot.get("env_idx", "serial-0"))
+        return trainer.select_action_with_context(norm_cur_state, context_id=context_id, evaluate=evaluate)
     return trainer.select_action(norm_cur_state, evaluate=evaluate)
 
 
@@ -425,6 +432,8 @@ def main(config):
     total_steps = 0
     episode = 0
     score_history = []
+    eps_episode_record = []
+    eps_train_step_record = []
     eps_reward_record = []
     eps_noise_record = []
     eps_time_record = []
@@ -503,7 +512,17 @@ def main(config):
                     next_state_norm, next_state, rewards, dones, info, _ = step_result
                     run["agent_snapshot"] = None
 
-                trainer.store_transition(run["norm_cur_state"], run["pending_actions"], rewards, next_state_norm, dones)
+                if hasattr(trainer, "store_transition_with_context"):
+                    trainer.store_transition_with_context(
+                        run["norm_cur_state"],
+                        run["pending_actions"],
+                        rewards,
+                        next_state_norm,
+                        dones,
+                        context_id=run["context_id"],
+                    )
+                else:
+                    trainer.store_transition(run["norm_cur_state"], run["pending_actions"], rewards, next_state_norm, dones)
                 _, _, run["single_eps_critic_cal_record"] = trainer.update(
                     i_episode=run["episode_id"],
                     total_step_count=total_steps,
@@ -552,6 +571,8 @@ def main(config):
                     continue
 
                 score_history.append(run["episode_reward"])
+                eps_episode_record.append(run["episode_id"])
+                eps_train_step_record.append(total_steps)
                 eps_reward_record.append(run["episode_reward"])
                 eps_time_record.append(current_step)
                 episode_wall_clock = time.perf_counter() - run["episode_start_time"]
@@ -659,6 +680,10 @@ def main(config):
 
     with open(os.path.join(plot_dir, "all_episode_reward.pickle"), "wb") as handle:
         pickle.dump(eps_reward_record, handle, protocol=pickle.HIGHEST_PROTOCOL)
+    with open(os.path.join(plot_dir, "all_episode_id.pickle"), "wb") as handle:
+        pickle.dump(eps_episode_record, handle, protocol=pickle.HIGHEST_PROTOCOL)
+    with open(os.path.join(plot_dir, "all_episode_train_step.pickle"), "wb") as handle:
+        pickle.dump(eps_train_step_record, handle, protocol=pickle.HIGHEST_PROTOCOL)
     with open(os.path.join(plot_dir, "all_episode_noise.pickle"), "wb") as handle:
         pickle.dump(eps_noise_record, handle, protocol=pickle.HIGHEST_PROTOCOL)
     with open(os.path.join(plot_dir, "all_episode_time.pickle"), "wb") as handle:
