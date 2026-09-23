@@ -9,14 +9,15 @@ DEFAULT_CONFIG = {
     "device": "auto",
     "dtype": "float32",
     "mode": "evaluate",  # or evaluate or train
-    "algorithm": "pcb_biased_att_iddpg",  # or maddpg, maddpg-critic-attention, mappo, maac, matd3, matd3-critic-attention, iddpg, att-iddpg, pcb_biased_att_iddpg, learned_pcb_biased_att_iddpg, gru-iddpg, fm-iddpg, orca
+    # "algorithm": "pcb_biased_att_iddpg",  # or maddpg, maddpg-critic-attention, mappo, maac, matd3, matd3-critic-attention, iddpg, att-iddpg, pcb_biased_att_iddpg, learned_pcb_biased_att_iddpg, gru-iddpg, fm-iddpg, orca
+    "algorithm": "maac",  # or maddpg, maddpg-critic-attention, mappo, maac, matd3, matd3-critic-attention, iddpg, att-iddpg, pcb_biased_att_iddpg, learned_pcb_biased_att_iddpg, gru-iddpg, fm-iddpg, orca
     "exp_name": "default_exp",
     "save_interval": 5000,
     "paths": {
         "project_root": str(PROJECT_ROOT),
         "resource_env_var": DEFAULT_RESOURCE_ENV_VAR,
         "checkpoint_dir": "checkpoints",
-        "checkpoint_run": "200726_08_49_19",  # this is for evaluation
+        "checkpoint_run": "210526_06_41_16",  # this is for evaluation, 070426_07_24_34-maddpg, 210526_06_41_16-maac, 070426_06_56_48-iddpg, 020626_05_51_16-mappo
         # "checkpoint_run": None,  # this is also used for training folder saving; training uses None
         "checkpoint_kind": "step",  # ep
         "checkpoint_value": 450000,
@@ -31,7 +32,7 @@ DEFAULT_CONFIG = {
         "n_agents": 8,
         "action_dim": 2,
         "max_steps": 100,
-        "nearest_neighbor_count": 0,
+        "nearest_neighbor_count": 3,
         "grid_obs_shape": [7, 7],
         "bound": [455, 680, 255, 385],
         "max_x": 1800,
