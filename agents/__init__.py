@@ -7,6 +7,7 @@ from agents.maac.trainer import MAACTrainer
 from agents.maddpg.trainer import MADDPGTrainer
 from agents.mappo.trainer import MAPPOTrainer
 from agents.matd3.trainer import MATD3Trainer
+from agents.no_cr.trainer import NoCRTrainer
 from agents.orca.trainer import ORCATrainer
 from agents.pcb_biased_att_iddpg.trainer import PCBBiasedATTIDDPGTrainer
 
@@ -36,5 +37,7 @@ def build_trainer(args):
         return MATD3Trainer(args)
     elif algo == "orca":
         return ORCATrainer(args)
+    elif algo in ("no-cr", "no_cr"):
+        return NoCRTrainer(args)
     else:
         raise ValueError(f"Unknown algorithm: {args['algorithm']}")

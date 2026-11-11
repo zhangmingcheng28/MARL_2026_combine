@@ -25,6 +25,10 @@ class MADDPGTrainer(BaseTrainer):
         self.gamma = config["train"]["gamma"]
         self.tau = config["train"]["tau"]
         self.batch_size = config["train"]["batch_size"]
+        self.learning_starts = max(
+            self.batch_size,
+            int(config["train"].get("learning_starts", self.batch_size)),
+        )
         self.update_every = config["train"]["update_every"]
         self.exploration = config.get("exploration", {})
         self.flags = config.get("flags", {})
@@ -55,7 +59,7 @@ class MADDPGTrainer(BaseTrainer):
             "actor_updated": False,
             "update_step": 0,
             "buffer_size": 0,
-            "learning_starts": self.batch_size,
+            "learning_starts": self.learning_starts,
             "batch_size": self.batch_size,
             "policy_delay": 1,
             "l2_reg": 0.0,
@@ -238,7 +242,7 @@ class MADDPGTrainer(BaseTrainer):
             "actor_updated": False,
             "update_step": 0 if i_episode is None else int(i_episode),
             "buffer_size": len(self.buffer),
-            "learning_starts": self.batch_size,
+            "learning_starts": self.learning_starts,
             "batch_size": self.batch_size,
             "policy_delay": 1,
             "l2_reg": 0.0,
@@ -249,7 +253,7 @@ class MADDPGTrainer(BaseTrainer):
         }
         if self.obs_dim is None:
             return None, None, single_eps_critic_cal_record
-        if len(self.buffer) < self.batch_size:
+        if len(self.buffer) < self.learning_starts:
             return None, None, single_eps_critic_cal_record
 
         obs_b, actions_b, rewards_b, next_obs_b, dones_b = self.buffer.sample(self.batch_size)
@@ -354,7 +358,7 @@ class MADDPGTrainer(BaseTrainer):
             "actor_updated": True,
             "update_step": int(i_episode if i_episode is not None else self.current_episode),
             "buffer_size": len(self.buffer),
-            "learning_starts": self.batch_size,
+            "learning_starts": self.learning_starts,
             "batch_size": self.batch_size,
             "policy_delay": 1,
             "l2_reg": 0.0,

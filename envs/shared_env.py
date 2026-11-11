@@ -84,6 +84,8 @@ class SharedMultiAgentEnv:
             random_map_idx=3,
             path_planner: str = "cbs",
             planner_fallback: str = "astar,jps",
+            repeat_simulation: bool = False,
+            repeat_od_file: Optional[str] = None,
     ):
         self.n_agents = n_agents
         self.action_dim = action_dim
@@ -112,6 +114,9 @@ class SharedMultiAgentEnv:
         self.mode = mode
         self.path_planner = str(path_planner).lower()
         self.planner_fallback = str(planner_fallback)
+        self.repeat_simulation = bool(repeat_simulation)
+        self.repeat_od_file = Path(repeat_od_file) if repeat_od_file else None
+        self._repeat_od_records = None
         self.observation_augmentor = GaussianPositionObservationAugmentor(0.0, 0.0)
         self.nearest_neighbor_count = 0
         self.step_count = 0
@@ -263,6 +268,8 @@ class SharedMultiAgentEnv:
             random_map_idx=env_cfg.get("random_map_idx", 3),
             path_planner=env_cfg.get("path_planner", "cbs"),
             planner_fallback=env_cfg.get("planner_fallback", "astar,jps"),
+            repeat_simulation=env_cfg.get("repeat_simulation", False),
+            repeat_od_file=paths_cfg.get("repeat_od_file"),
         )
         env.nearest_neighbor_count = max(0, int(env_cfg.get("nearest_neighbor_count", 0)))
         augment_cfg = config.get("augment", {})
@@ -291,6 +298,64 @@ class SharedMultiAgentEnv:
                 self.world_map_2D_jps,
             )
         raise ValueError("Unsupported planner '{}'".format(planner_name))
+
+    def _load_repeat_od_records(self):
+        if self._repeat_od_records is not None:
+            return self._repeat_od_records
+        if self.repeat_od_file is None:
+            raise ValueError("repeat_simulation=True requires repeat_od_file to be set.")
+        if not self.repeat_od_file.exists():
+            raise FileNotFoundError("Repeat OD file does not exist: {}".format(self.repeat_od_file))
+        try:
+            with open(self.repeat_od_file, "rb") as handle:
+                records = pickle.load(handle)
+        except ModuleNotFoundError as exc:
+            if not str(getattr(exc, "name", "")).startswith("numpy._core"):
+                raise
+            import numpy as _np
+            sys.modules.setdefault("numpy._core", _np.core)
+            sys.modules.setdefault("numpy._core.numeric", _np.core.numeric)
+            sys.modules.setdefault("numpy._core.multiarray", _np.core.multiarray)
+            with open(self.repeat_od_file, "rb") as handle:
+                records = pickle.load(handle)
+        if not records:
+            raise ValueError("Repeat OD file is empty: {}".format(self.repeat_od_file))
+        self._repeat_od_records = records
+        return self._repeat_od_records
+
+    def _repeat_od_for_episode(self, episode):
+        records = self._load_repeat_od_records()
+        episode_index = int(episode) - 1
+        if episode_index < 0 or episode_index >= len(records):
+            raise IndexError(
+                "Repeat OD episode {} is unavailable in {}. File contains {} episodes.".format(
+                    int(episode),
+                    self.repeat_od_file,
+                    len(records),
+                )
+            )
+        episode_record = records[episode_index]
+        if isinstance(episode_record, (list, tuple)) and episode_record:
+            return episode_record[0]
+        return episode_record
+
+    def _repeat_od_pair(self, episode_ods, agent_idx):
+        if agent_idx in episode_ods:
+            agent_od = episode_ods[agent_idx]
+        elif str(agent_idx) in episode_ods:
+            agent_od = episode_ods[str(agent_idx)]
+        else:
+            raise KeyError("Repeat OD episode is missing agent index {}.".format(agent_idx))
+        if len(agent_od) < 2:
+            raise ValueError("Repeat OD entry for agent {} must contain [goal, initial_position].".format(agent_idx))
+
+        goal_path = agent_od[0]
+        initial_position = agent_od[1]
+        if len(goal_path) == 0:
+            raise ValueError("Repeat OD entry for agent {} has an empty goal path.".format(agent_idx))
+        start_pos = tuple(initial_position)
+        end_pos = tuple(goal_path[-1])
+        return start_pos, end_pos
 
     def _grid_path_to_world_points(self, grid_path):
         if self._using_precomputed_maps:
@@ -1063,11 +1128,7 @@ class SharedMultiAgentEnv:
         start_pos_memory = []
         random_end_pos_collection = []
         planning_requests = []
-        # repeat simulation
-        # with open(
-        #         r'F:\githubClone\MARL_2nd_paper\80%_sortie_reach_change_map_HS\repeat_OD_for_orca_uav_5.pickle', 'rb') as handle:
-        #     OD_eta_record = pickle.load(handle)
-        #     agent_ODs = OD_eta_record[episode-1]
+        repeat_episode_ods = self._repeat_od_for_episode(episode) if self.repeat_simulation else None
 
         for agentIdx in self.all_uavs.keys():
 
@@ -1109,6 +1170,9 @@ class SharedMultiAgentEnv:
             # random_start_pos = one_set_SE_collection[agentIdx][0]
             # random_end_pos = one_set_SE_collection[agentIdx][1]
 
+            if repeat_episode_ods is not None:
+                random_start_pos, random_end_pos = self._repeat_od_pair(repeat_episode_ods, agentIdx)
+
             random_end_pos_collection.append([random_start_pos, random_end_pos])
             host_current_circle = Point(np.array(random_start_pos)[0], np.array(random_start_pos)[1]).buffer(
                 self.all_uavs[agentIdx].protectiveBound)
@@ -1122,10 +1186,6 @@ class SharedMultiAgentEnv:
 
             # random_start_pos = random_start_pos_list[agentIdx]
             # random_end_pos = random_end_pos_list[agentIdx]
-
-            # repeat simulation
-            # random_start_pos = tuple(agent_ODs[0][agentIdx][1])
-            # random_end_pos = tuple(agent_ODs[0][agentIdx][0][-1])
 
             self.all_uavs[agentIdx].pos = np.array(random_start_pos)
             self.all_uavs[agentIdx].pre_pos = np.array(random_start_pos)
@@ -1141,6 +1201,25 @@ class SharedMultiAgentEnv:
             self.all_uavs[agentIdx].planned_path_grid = []
             self.all_uavs[agentIdx].planned_path_world = []
             self.all_uavs[agentIdx].path_planner = None
+
+            if random_start_pos not in self.centroid_to_position_empty:
+                raise KeyError(
+                    "Repeat OD start {} for agent {} is not available in map {}. "
+                    "Use the same random_map_idx/map bundle used to create the OD file.".format(
+                        random_start_pos,
+                        agentIdx,
+                        self.current_random_map_idx,
+                    )
+                )
+            if random_end_pos not in self.centroid_to_position_empty:
+                raise KeyError(
+                    "Repeat OD destination {} for agent {} is not available in map {}. "
+                    "Use the same random_map_idx/map bundle used to create the OD file.".format(
+                        random_end_pos,
+                        agentIdx,
+                        self.current_random_map_idx,
+                    )
+                )
 
             small_area_map_s = self.centroid_to_position_empty[random_start_pos]
             small_area_map_e = self.centroid_to_position_empty[random_end_pos]

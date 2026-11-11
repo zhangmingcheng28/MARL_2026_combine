@@ -10,3 +10,9 @@
 *.pyc
 *.pyc
 *.png
+/evaluation_record
+/checkpoints
+*.gif
+*.json
+/tests
+*.md

@@ -1,6 +1,7 @@
 import numpy as np
 import os
 import pickle
+import json
 from envs.shared_env import SharedMultiAgentEnv
 from agents import build_trainer
 from utils.plotting_helper import *
@@ -24,16 +25,21 @@ def _select_actions(trainer, env, norm_cur_state, evaluate):
 
 def main(config):
     config["mode"] = "eval"
+    cur_algo = config["algorithm"]
+    check_point_run = config['paths']['checkpoint_run']
     env = SharedMultiAgentEnv.from_config(config)
     trainer = build_trainer(config)
     checkpoint_paths = config.get("paths", {})
     checkpoint_dir = checkpoint_paths.get("checkpoint_dir", "checkpoints")
     checkpoint_tag = _build_checkpoint_tag(checkpoint_paths)
-    trainer.load_for_eval(checkpoint_dir, checkpoint_tag=checkpoint_tag)
-    if checkpoint_tag:
-        print(f"[EVAL] Loading checkpoint '{checkpoint_tag}' from: {checkpoint_dir}")
+    if not getattr(trainer, "requires_checkpoint", True):
+        print("[EVAL] Using {} controller; no checkpoint required.".format(cur_algo))
     else:
-        print(f"[EVAL] Loading latest/default checkpoint files from: {checkpoint_dir}")
+        trainer.load_for_eval(checkpoint_dir, checkpoint_tag=checkpoint_tag)
+        if checkpoint_tag:
+            print(f"[EVAL] Loading checkpoint '{checkpoint_tag}' from: {checkpoint_dir}")
+        else:
+            print(f"[EVAL] Loading latest/default checkpoint files from: {checkpoint_dir}")
 
     flags = config.get("flags", {})
     env_cfg = config["env"]
@@ -210,13 +216,16 @@ def main(config):
         print("saving")
 
     include_building_in_overall_conflict = flags.get("include_building_in_overall_conflict", False)
-    pickle_name = "repeat_OD_for_orca_uav_{}".format(total_agent_num)
+    pickle_name = "repeat_OD_for_any_algo_uav_{}_{}_{}".format(total_agent_num, cur_algo,check_point_run)
     if not include_building_in_overall_conflict:
         pickle_name = "{}_nobuilding".format(pickle_name)
-    pickle_name = "{}_rev1.pickle".format(pickle_name)
+    pickle_name = "{}.pickle".format(pickle_name)  # this is required for having .pickle behind
+    pickle_name = checkpoint_paths.get("evaluation_output_file") or pickle_name
+    os.makedirs(os.path.dirname(os.path.abspath(pickle_name)), exist_ok=True)
 
     with open(pickle_name, 'wb') as handle:
         pickle.dump(evaluation_OD_repeatability, handle, protocol=pickle.HIGHEST_PROTOCOL)
+    print("[EVAL] Saved trajectories to: {}".format(pickle_name))
     if evaluation_by_episode:
         print("total collision count is {}, {}%".format(collision_count, round(collision_count / eval_episodes * 100, 2)))
         print("Collision due to bound is {}".format(crash_to_bound))
@@ -239,7 +248,7 @@ def main(config):
         print("Destination reached {}".format(sorties_reached))
         print("Idle UAV {}".format(idle_drone))
 
-    return {
+    summary = {
         "total_collision": collision_count,
         "collision_to_bound": crash_to_bound,
         "collision_to_building": crash_to_building,
@@ -251,3 +260,20 @@ def main(config):
         "reached_goal_drones": drone_reached_per_eps,
         "total_eval_steps": total_step,
     }
+    reached = drone_reached_per_eps if evaluation_by_episode else sorties_reached
+    summary.update({
+        "algorithm": cur_algo,
+        "seed": config.get("seed", 777),
+        "eval_episodes": eval_episodes,
+        "n_agents": total_agent_num,
+        "total_sorties": eval_episodes * total_agent_num,
+        "success_rate_percent": 100.0 * reached / (eval_episodes * total_agent_num),
+    })
+    summary_path = os.path.splitext(pickle_name)[0] + "_summary.json"
+    with open(summary_path, "w", encoding="utf-8") as handle:
+        json.dump(summary, handle, indent=2)
+    print("[EVAL] Arrival rate: {}/{} ({:.2f}%)".format(
+        reached, summary["total_sorties"], summary["success_rate_percent"],
+    ))
+    print("[EVAL] Saved statistics to: {}".format(summary_path))
+    return summary

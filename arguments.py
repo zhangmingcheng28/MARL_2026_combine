@@ -9,15 +9,16 @@ DEFAULT_CONFIG = {
     "device": "auto",
     "dtype": "float32",
     "mode": "evaluate",  # or evaluate or train
-    # "algorithm": "pcb_biased_att_iddpg",  # or maddpg, maddpg-critic-attention, mappo, maac, matd3, matd3-critic-attention, iddpg, att-iddpg, pcb_biased_att_iddpg, learned_pcb_biased_att_iddpg, gru-iddpg, fm-iddpg, orca
-    "algorithm": "maac",  # or maddpg, maddpg-critic-attention, mappo, maac, matd3, matd3-critic-attention, iddpg, att-iddpg, pcb_biased_att_iddpg, learned_pcb_biased_att_iddpg, gru-iddpg, fm-iddpg, orca
+    "algorithm": "mappo",  # or maddpg, maddpg-critic-attention, mappo, maac, matd3, matd3-critic-attention, iddpg, att-iddpg, pcb_biased_att_iddpg, learned_pcb_biased_att_iddpg, gru-iddpg, fm-iddpg, orca
+    # "algorithm": "maac",  # or maddpg, maddpg-critic-attention, mappo, maac, matd3, matd3-critic-attention, iddpg, att-iddpg, pcb_biased_att_iddpg, learned_pcb_biased_att_iddpg, gru-iddpg, fm-iddpg, orca
+    # Evaluation-only no-conflict-resolution controller: "no-cr" (alias "no_cr").
     "exp_name": "default_exp",
     "save_interval": 5000,
     "paths": {
         "project_root": str(PROJECT_ROOT),
         "resource_env_var": DEFAULT_RESOURCE_ENV_VAR,
         "checkpoint_dir": "checkpoints",
-        "checkpoint_run": "210526_06_41_16",  # this is for evaluation, 070426_07_24_34-maddpg, 210526_06_41_16-maac, 070426_06_56_48-iddpg, 020626_05_51_16-mappo
+        "checkpoint_run": "020626_05_51_16",  # this is for evaluation, pcb_biased_att_iddpg-200726_08_49_19 070426_07_24_34-maddpg, 210526_06_41_16-maac, 070426_06_56_48-iddpg, 020626_05_51_16-mappo
         # "checkpoint_run": None,  # this is also used for training folder saving; training uses None
         "checkpoint_kind": "step",  # ep
         "checkpoint_value": 450000,
@@ -25,6 +26,7 @@ DEFAULT_CONFIG = {
         "shape_file": "resources/lakesideMap/lakeSide.shp",
         "agent_config_file": "resources/fixedDrone_3drones.xlsx",
         "map_bundle_dir": "resources/precomputed_maps",
+        "repeat_od_file": "repeat_OD_for_any_algo_uav_8_pcb_biased_att_iddpg_nobuilding.pickle",
         "legacy_code_dir": None,
         "orca_code_dir": r"F:\githubClone\deepQ_learning_newVer\nf_dqn_v3_2_LSTM_Attention",
     },
@@ -32,7 +34,7 @@ DEFAULT_CONFIG = {
         "n_agents": 8,
         "action_dim": 2,
         "max_steps": 100,
-        "nearest_neighbor_count": 3,
+        "nearest_neighbor_count": 3,  # set to 0 when using attention mechanism
         "grid_obs_shape": [7, 7],
         "bound": [455, 680, 255, 385],
         "max_x": 1800,
@@ -46,15 +48,18 @@ DEFAULT_CONFIG = {
         # "path_planner": "cbs",
         "path_planner": "astar",
         "planner_fallback": "jps",
+        "repeat_simulation": True,
         "full_observable_critic": False,
         "evaluation_by_episode": False,
     },
     "train": {
         "num_episodes": 20000,
         "total_steps": 450000,
-        "num_parallel_envs": 1,
+        "num_parallel_envs": 50,
         "stop_mode": "step",  # or "step" or "episode"
-        "batch_size": 12,
+        "train_eval_interval": 2500,
+        "train_eval_episodes": 10,
+        "batch_size": 512,
         "buffer_size": int(1e5),
         "actor_lr": 0.0001,
         "critic_lr": 0.0001,
@@ -104,9 +109,9 @@ DEFAULT_CONFIG = {
         "use_selfatt_with_radar": False,
         "use_all_neigh_with_radar": True,  # for iddpg only, keep it, otherwise training will fail
         "use_critic_attention": False,
-        "use_dec_reward": False,
+        "use_dec_reward": True,
         "use_path_following_reward": True,
-        "include_building_in_overall_conflict": True,
+        "include_building_in_overall_conflict": False,
         "own_obs_only": False,
     },
     "eval": {
@@ -143,7 +148,7 @@ def _build_checkpoint_tag(checkpoint_kind, checkpoint_value):
     return "{}{}".format(checkpoint_kind, int(checkpoint_value))
 
 
-def get_args():
+def get_args(argv=None):
     parser = argparse.ArgumentParser()
 
     parser.add_argument("--mode", type=str, default=DEFAULT_CONFIG["mode"], choices=["train", "evaluate"])
@@ -151,7 +156,7 @@ def get_args():
         "--algo",
         type=str,
         default=DEFAULT_CONFIG["algorithm"],
-        choices=["iddpg", "att-iddpg", "pcb_biased_att_iddpg", "learned_pcb_biased_att_iddpg", "gru-iddpg", "fm-iddpg", "maddpg", "maddpg-critic-attention", "mappo", "maac", "matd3", "matd3-critic-attention", "orca"],
+        choices=["iddpg", "att-iddpg", "pcb_biased_att_iddpg", "learned_pcb_biased_att_iddpg", "gru-iddpg", "fm-iddpg", "maddpg", "maddpg-critic-attention", "mappo", "maac", "matd3", "matd3-critic-attention", "orca", "no-cr", "no_cr"],
     )
     parser.add_argument("--exp_name", type=str, default=DEFAULT_CONFIG["exp_name"])
 
@@ -172,12 +177,16 @@ def get_args():
     )
     parser.add_argument("--path_planner", type=str, default=DEFAULT_CONFIG["env"]["path_planner"])
     parser.add_argument("--planner_fallback", type=str, default=DEFAULT_CONFIG["env"]["planner_fallback"])
+    parser.add_argument("--repeat_simulation", action="store_true", default=DEFAULT_CONFIG["env"]["repeat_simulation"])
+    parser.add_argument("--no_repeat_simulation", action="store_false", dest="repeat_simulation")
     parser.add_argument("--acc_max", type=float, default=DEFAULT_CONFIG["env"]["acc_max"])
     parser.add_argument("--max_speed", type=float, default=DEFAULT_CONFIG["env"]["max_speed"])
 
     parser.add_argument("--num_episodes", type=int, default=DEFAULT_CONFIG["train"]["num_episodes"])
     parser.add_argument("--total_steps", type=int, default=DEFAULT_CONFIG["train"]["total_steps"])
     parser.add_argument("--num_parallel_envs", type=int, default=DEFAULT_CONFIG["train"]["num_parallel_envs"])
+    parser.add_argument("--train_eval_interval", type=int, default=DEFAULT_CONFIG["train"]["train_eval_interval"])
+    parser.add_argument("--train_eval_episodes", type=int, default=DEFAULT_CONFIG["train"]["train_eval_episodes"])
     parser.add_argument(
         "--stop_mode",
         type=str,
@@ -251,6 +260,11 @@ def get_args():
         default=DEFAULT_CONFIG["flags"]["include_building_in_overall_conflict"],
     )
     parser.add_argument("--own_obs_only", action="store_true", default=DEFAULT_CONFIG["flags"]["own_obs_only"])
+    parser.add_argument(
+        "--no_include_building_in_overall_conflict",
+        action="store_false",
+        dest="include_building_in_overall_conflict",
+    )
 
     parser.add_argument("--device", type=str, default=DEFAULT_CONFIG["device"])
     parser.add_argument("--dtype", type=str, default=DEFAULT_CONFIG["dtype"], choices=["float32", "float64"])
@@ -265,10 +279,12 @@ def get_args():
     parser.add_argument("--shape_file", type=str, default=DEFAULT_CONFIG["paths"]["shape_file"])
     parser.add_argument("--agent_config_file", type=str, default=DEFAULT_CONFIG["paths"]["agent_config_file"])
     parser.add_argument("--map_bundle_dir", type=str, default=DEFAULT_CONFIG["paths"]["map_bundle_dir"])
+    parser.add_argument("--repeat_od_file", type=str, default=DEFAULT_CONFIG["paths"]["repeat_od_file"])
+    parser.add_argument("--evaluation_output_file", type=str, default=None)
     parser.add_argument("--legacy_code_dir", type=str, default=DEFAULT_CONFIG["paths"]["legacy_code_dir"])
     parser.add_argument("--orca_code_dir", type=str, default=DEFAULT_CONFIG["paths"]["orca_code_dir"])
 
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def build_config(args):
@@ -282,7 +298,7 @@ def build_config(args):
     config["dtype"] = args.dtype
     config["save_interval"] = args.save_interval
 
-    checkpoint_run = None if args.mode == "train" else args.checkpoint_run
+    checkpoint_run = None if args.mode == "train" or args.algo in ("no-cr", "no_cr") else args.checkpoint_run
 
     checkpoint_dir = args.checkpoint_dir
     if checkpoint_run not in (None, ""):
@@ -296,6 +312,8 @@ def build_config(args):
     config["paths"]["shape_file"] = resolve_path(args.shape_file)
     config["paths"]["agent_config_file"] = resolve_path(args.agent_config_file)
     config["paths"]["map_bundle_dir"] = _resolve_optional_path(args.map_bundle_dir)
+    config["paths"]["repeat_od_file"] = _resolve_optional_path(args.repeat_od_file)
+    config["paths"]["evaluation_output_file"] = _resolve_optional_path(args.evaluation_output_file)
     config["paths"]["legacy_code_dir"] = _resolve_optional_path(args.legacy_code_dir)
     config["paths"]["orca_code_dir"] = _resolve_optional_path(args.orca_code_dir)
 
@@ -308,6 +326,7 @@ def build_config(args):
     config["env"]["random_map_idx"] = _parse_random_map_idx(args.random_map_idx)
     config["env"]["path_planner"] = str(args.path_planner).lower()
     config["env"]["planner_fallback"] = str(args.planner_fallback)
+    config["env"]["repeat_simulation"] = bool(args.repeat_simulation)
     config["env"]["acc_max"] = args.acc_max
     config["env"]["max_speed"] = args.max_speed
     config["env"]["resource_file"] = config["paths"]["resource_file"]
@@ -315,6 +334,8 @@ def build_config(args):
     config["train"]["num_episodes"] = args.num_episodes
     config["train"]["total_steps"] = args.total_steps
     config["train"]["num_parallel_envs"] = max(1, int(args.num_parallel_envs))
+    config["train"]["train_eval_interval"] = max(0, int(args.train_eval_interval))
+    config["train"]["train_eval_episodes"] = max(1, int(args.train_eval_episodes))
     config["train"]["stop_mode"] = args.stop_mode
     config["train"]["batch_size"] = args.batch_size
     config["train"]["buffer_size"] = args.buffer_size

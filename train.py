@@ -395,6 +395,71 @@ def _append_evaluation_status(log_path, status, message=None):
             handle.write("message: {}\n".format(message))
 
 
+def _training_eval_record(eval_summary, train_step, episode, checkpoint_kind, checkpoint_value, eval_episodes):
+    eval_summary = eval_summary or {}
+    total_collision = int(eval_summary.get("total_collision", 0))
+    collision_to_bound = int(eval_summary.get("collision_to_bound", 0))
+    collision_to_building = int(eval_summary.get("collision_to_building", 0))
+    collision_to_drone = int(eval_summary.get("collision_to_drone", 0))
+    destination_reached = int(eval_summary.get("destination_reached", 0))
+    idle_uav = int(eval_summary.get("idle_uav", 0))
+    return {
+        "train_step": int(train_step),
+        "episode": int(episode),
+        "checkpoint_kind": checkpoint_kind,
+        "checkpoint_value": int(checkpoint_value),
+        "eval_episodes": int(eval_episodes),
+        "total_collision": total_collision,
+        "collision_to_bound": collision_to_bound,
+        "collision_to_building": collision_to_building,
+        "collision_to_drone": collision_to_drone,
+        "destination_reached": destination_reached,
+        "idle_uav": idle_uav,
+        "Total collision": total_collision,
+        "Collision to bound": collision_to_bound,
+        "Collision to building": collision_to_building,
+        "Collision to drone": collision_to_drone,
+        "Destination reached": destination_reached,
+        "Idle UAV": idle_uav,
+    }
+
+
+def _write_training_eval_records(plot_dir, records):
+    with open(os.path.join(plot_dir, "train_eval_record.pickle"), "wb") as handle:
+        pickle.dump(records, handle, protocol=pickle.HIGHEST_PROTOCOL)
+
+
+def _run_training_evaluation(config, checkpoint_dir, train_step, episode, eval_episodes):
+    from evaluate import main as evaluate_main
+
+    checkpoint_kind = "step"
+    checkpoint_value = int(train_step)
+    eval_config = deepcopy(config)
+    eval_config["mode"] = "eval"
+    eval_config["paths"]["checkpoint_dir"] = checkpoint_dir
+    eval_config["paths"]["checkpoint_kind"] = checkpoint_kind
+    eval_config["paths"]["checkpoint_value"] = checkpoint_value
+    eval_config["eval"]["episodes"] = int(eval_episodes)
+
+    print(
+        "[TRAIN-EVAL] Running {} evaluation episodes at train step {}.".format(
+            int(eval_episodes),
+            int(train_step),
+        )
+    )
+    eval_summary = evaluate_main(eval_config)
+    record = _training_eval_record(
+        eval_summary,
+        train_step=train_step,
+        episode=episode,
+        checkpoint_kind=checkpoint_kind,
+        checkpoint_value=checkpoint_value,
+        eval_episodes=eval_episodes,
+    )
+    print("[TRAIN-EVAL] Recorded summary: {}".format(record))
+    return record
+
+
 def main(config):
     training_start_time = time.perf_counter()
     config = create_training_run_dirs(config)
@@ -409,6 +474,9 @@ def main(config):
     total_steps_budget = train_cfg["total_steps"]
     num_parallel_envs = max(1, int(train_cfg.get("num_parallel_envs", 1)))
     stop_mode = train_cfg.get("stop_mode", "episode")
+    train_eval_interval = max(0, int(train_cfg.get("train_eval_interval", 0)))
+    train_eval_episodes = max(1, int(train_cfg.get("train_eval_episodes", 50)))
+    next_train_eval_step = train_eval_interval if train_eval_interval > 0 else None
     if stop_mode not in ("episode", "step"):
         raise ValueError("Unsupported stop_mode: {}. Expected 'episode' or 'step'.".format(stop_mode))
     stop_target = num_episodes if stop_mode == "episode" else total_steps_budget
@@ -446,6 +514,7 @@ def main(config):
     crash_to_building = 0
     crash_to_drone = 0
     crash_due_to_nearest = 0
+    train_eval_records = []
     active_runs = []
     stop_training = False
 
@@ -455,6 +524,8 @@ def main(config):
     print(f"[TRAIN] Parallel environments: {num_parallel_envs}")
     print(f"[TRAIN] Env execution mode: {'subprocess' if use_subproc_envs else 'serial'}")
     print(f"[TRAIN] Stop mode: {stop_mode} ({stop_target_name}={stop_target})")
+    if train_eval_interval > 0:
+        print(f"[TRAIN] Evaluation during training: every {train_eval_interval} steps, {train_eval_episodes} episodes each.")
 
     for env_slot in env_slots:
         if stop_mode == "episode" and episode >= num_episodes:
@@ -559,6 +630,25 @@ def main(config):
                     step=total_steps,
                 )
                 run.pop("pending_actions", None)
+
+                if train_eval_interval > 0 and total_steps >= next_train_eval_step:
+                    trainer.save(
+                        checkpoint_dir,
+                        episode=run["episode_id"],
+                        step=total_steps,
+                        stop_mode="step",
+                    )
+                    train_eval_records.append(
+                        _run_training_evaluation(
+                            config,
+                            checkpoint_dir=checkpoint_dir,
+                            train_step=total_steps,
+                            episode=run["episode_id"],
+                            eval_episodes=train_eval_episodes,
+                        )
+                    )
+                    _write_training_eval_records(plot_dir, train_eval_records)
+                    next_train_eval_step += train_eval_interval
 
                 episode_finished = _finalize_episode_run(run, env_cfg, info, dones, current_step)
                 if budget_reached:
